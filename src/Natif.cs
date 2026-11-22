@@ -32,6 +32,22 @@ namespace OrdinateurAPlusieurs
     struct INPUT { public uint type; public MOUSEINPUT mi; }
 
     [StructLayout(LayoutKind.Sequential)]
+    struct KBDLLHOOKSTRUCT { public uint vkCode, scanCode, flags, time; public IntPtr dwExtraInfo; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct KEYBDINPUT { public ushort wVk, wScan; public uint dwFlags, time; public IntPtr dwExtraInfo; }
+
+    /// INPUT pour le clavier : même taille que INPUT (souris) en 32 et en 64 bits.
+    [StructLayout(LayoutKind.Sequential)]
+    struct INPUTCLAVIER { public uint type; public KEYBDINPUT ki; public uint bourrage1, bourrage2; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct ICONINFO { public bool fIcon; public int xHotspot, yHotspot; public IntPtr hbmMask, hbmColor; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct BITMAP { public int bmType, bmWidth, bmHeight, bmWidthBytes; public ushort bmPlanes, bmBitsPixel; public IntPtr bmBits; }
+
+    [StructLayout(LayoutKind.Sequential)]
     struct RAWINPUTDEVICE { public ushort usUsagePage, usUsage; public uint dwFlags; public IntPtr hwndTarget; }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -60,7 +76,20 @@ namespace OrdinateurAPlusieurs
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetModuleHandle(string name);
 
         [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
-        [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+        [DllImport("user32.dll", EntryPoint = "SendInput")] public static extern uint SendInputClavier(uint n, INPUTCLAVIER[] inputs, int size);
+        [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+        [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, IntPtr pid);
+        [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint from, uint to, bool attach);
+        [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+        [DllImport("user32.dll")] public static extern IntPtr LoadCursor(IntPtr hInst, IntPtr id);
+        [DllImport("user32.dll")] public static extern bool GetIconInfo(IntPtr h, out ICONINFO ii);
+        [DllImport("gdi32.dll")] public static extern int GetObject(IntPtr h, int size, out BITMAP bm);
+        [DllImport("user32.dll")] public static extern bool DrawIconEx(IntPtr hdc, int x, int y, IntPtr h, int cx, int cy, int step, IntPtr brush, int flags);
+        [DllImport("gdi32.dll")] public static extern bool GdiFlush();
+        [DllImport("user32.dll", SetLastError = true)] public static extern bool SetCursorPos(int x, int y);
         [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 
@@ -78,6 +107,7 @@ namespace OrdinateurAPlusieurs
         [DllImport("user32.dll")] public static extern IntPtr MonitorFromPoint(POINT pt, uint flags);
         [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
 
+        [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, int msg, IntPtr w, IntPtr l);
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hwnd, int id, uint modifiers, uint vk);
         [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hwnd, int id);
 

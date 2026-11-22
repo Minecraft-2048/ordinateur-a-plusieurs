@@ -4,49 +4,65 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
 using System.Windows.Forms;
 
 // Le cœur de l'appli.
 //
-// Windows n'a qu'un seul vrai curseur et mélange toutes les souris dedans. Alors :
-//  - « Raw Input » nous dit quelle souris a bougé (chaque souris a sa poignée) ;
-//  - un crochet bas niveau (WH_MOUSE_LL) bloque les gestes des vraies souris dès qu'il y a 2 joueurs ;
-//  - on renvoie nous-mêmes les gestes du joueur principal (SendInput, marqué MARQUE) : il garde
-//    le vrai curseur de Windows, avec sa vitesse et son accélération habituelles ;
-//  - les autres joueurs ont un curseur dessiné (une vitre transparente) que l'on déplace nous-mêmes.
-//    Quand l'un d'eux clique ou tourne la molette, le vrai curseur « saute » chez lui le temps
-//    du geste (un glisser-déposer marche aussi), puis revient chez le joueur principal.
+// Windows n'a qu'un seul vrai curseur et un seul clavier « logique ». Alors :
+//  - Raw Input dit quelle souris / quel clavier a envoyé chaque geste ;
+//  - des crochets bas niveau (WH_MOUSE_LL, WH_KEYBOARD_LL) bloquent les gestes des vrais appareils
+//    dès qu'il y a 2 joueurs, et l'appli renvoie elle-même ce qu'il faut (SendInput, marqué MARQUE) ;
+//  - le vrai curseur de Windows appartient au joueur qui bouge (le « porteur ») : il a le survol
+//    (croix rouge, boutons qui s'allument) et exactement la vitesse de Windows. Les autres joueurs
+//    ont un curseur dessiné ; dès que le porteur s'arrête un instant, ou qu'un autre joueur clique,
+//    le vrai curseur passe chez lui ;
+//  - chaque clavier est lié à un joueur : il n'écrit qu'à l'endroit choisi par la souris de ce joueur.
+//
+// Trois fils : un pour les crochets (il ne fait rien d'autre, pour répondre tout de suite à Windows),
+// un pour Raw Input et l'envoi des gestes, et le fil de l'interface (icône, dessins des curseurs).
 namespace OrdinateurAPlusieurs
 {
+    sealed class Clavier
+    {
+        public string Cle;
+        public int Num;
+        public Joueur Joueur;
+    }
+
     sealed class Joueur
     {
         public int Num;
         public string Cle;
         public double X, Y;
-        public int Boutons;            // boutons tenus en ce moment (bits)
-        public int DerniereActivite;   // Environment.TickCount
-        public double DernierEvt;      // ms (chrono), pour la vitesse du geste
-        public double DernierDessin;
-        public bool EnRetard;
-        public Calque Calque;
+        public double ResteX, ResteY;
+        public int Boutons;
+        public int DerniereActivite;
+        public double DernierEvt, DernierMouvement, DernierBouton;
+        public double Agitation;  // mouvements récents (s'efface en ~150 ms) : les petites secousses ne comptent pas
+        public IntPtr Fenetre;   // la fenêtre où ce joueur a cliqué ou écrit en dernier
+        public Clavier Clavier;
+        // Côté interface
+        public Calque Calque, Pastille;
+        public int VersionDessin = -1;
     }
 
-    sealed class FenetreBrute : NativeWindow
+    /// Une fenêtre invisible qui reçoit les messages d'un fil.
+    sealed class FenetreFil : NativeWindow
     {
-        readonly Moteur moteur;
-        public FenetreBrute(Moteur m)
+        public delegate void Traiteur(ref Message m);
+        readonly Traiteur traiteur;
+        public FenetreFil(string nom, Traiteur t)
         {
-            moteur = m;
+            traiteur = t;
             CreateParams cp = new CreateParams();
-            cp.Caption = "Ordinateur à plusieurs - souris";
+            cp.Caption = "Ordinateur à plusieurs - " + nom;
             cp.Style = unchecked((int)0x80000000); // WS_POPUP, jamais affichée
             CreateHandle(cp);
         }
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == 0x00FF) moteur.SurBrut(m.LParam);                                  // WM_INPUT
-            else if (m.Msg == 0x00FE && m.WParam.ToInt64() == 2) moteur.SurDebranche(m.LParam); // WM_INPUT_DEVICE_CHANGE, retrait
-            else if (m.Msg == 0x0312) moteur.BasculerPause();                               // WM_HOTKEY
+            traiteur(ref m);
             base.WndProc(ref m);
         }
     }
@@ -54,35 +70,56 @@ namespace OrdinateurAPlusieurs
     sealed class Moteur
     {
         public const long MARQUE = 0x4D554C54; // « MULT » : nos propres gestes envoyés à Windows
-        const int OUBLI_MS = 10 * 60 * 1000;   // une souris immobile 10 min perd son curseur
+        public static bool Essai;              // --essai : les gestes marqués 0x7771 / 0x7772 jouent deux fausses souris
+        const int WM_APP_REINSTALLER = 0x8001, WM_APP_FIN = 0x8002;
+        const double PASSAGE_MS = 200;          // le porteur doit être immobile ce temps-là pour céder le vrai curseur
+        const int OUBLI_MS = 10 * 60 * 1000;    // une souris immobile 10 min perd son curseur
 
         static readonly double[] VitessesWindows = { 0, 1 / 32.0, 1 / 16.0, 1 / 8.0, 2 / 8.0, 3 / 8.0, 4 / 8.0, 5 / 8.0, 6 / 8.0, 7 / 8.0, 1.0,
             1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.25, 3.5 };
 
         readonly Reglages reglages;
-        readonly HookProc proc;
+        readonly object verrou = new object();
+        readonly Stopwatch chrono = Stopwatch.StartNew();
+        SynchronizationContext ui;
+
+        // ----- fil des crochets -----
+        Thread filCrochets;
+        FenetreFil fenCrochets;
+        HookProc procSouris, procClavier;
+        IntPtr crochetSouris, crochetClavier;
+        volatile bool bloquerSouris, bloquerClavier, physEnAttente;
+        int dernierPhys, crochetPhys, crochetPhysBloques, injVus, clavAttente;
+        static readonly int decalageExtraSouris = IntPtr.Size == 8 ? 24 : 20;
+
+        // ----- fil de Raw Input -----
+        Thread filEntrees;
+        FenetreFil fenEntrees;
+        IntPtr brut;
+        readonly INPUT[] tampon = new INPUT[1];
+        readonly INPUTCLAVIER[] tamponClavier = new INPUTCLAVIER[1];
+        readonly int tailleInput = Marshal.SizeOf(typeof(INPUT));
+        int brutPhys, injEnvoyes;
+
+        // ----- état partagé (sous verrou) -----
         readonly Joueur[] places = new Joueur[5];
         readonly Dictionary<string, Joueur> parCle = new Dictionary<string, Joueur>();
         readonly Dictionary<IntPtr, string> cles = new Dictionary<IntPtr, string>();
-        readonly INPUT[] tampon = new INPUT[1];
-        readonly int tailleInput = Marshal.SizeOf(typeof(INPUT));
-        readonly Stopwatch chrono = Stopwatch.StartNew();
-        readonly Bitmap[] images = new Bitmap[5];
-        readonly Timer minuteDessin = new Timer(), minuteGarde = new Timer(), minuteRetour = new Timer();
-        FenetreBrute fenetre;
-        IntPtr crochet, brut;
-        Joueur maitre, emprunteur;
-        bool actif, pause, secoursDefinitif;
+        readonly Dictionary<string, Clavier> claviers = new Dictionary<string, Clavier>();
+        List<Joueur> retires = new List<Joueur>();
+        Joueur porteur, focus, associerPour;
+        bool actif, clavierActif, pause, secoursDefinitif;
         string secours;
         IntPtr secoursFenetre;
-        int secoursDebut, tours;
-        float taille;
+        int secoursDebut, tours, evtsSouris, evtsClavier;
         double facteurWindows = 1;
         bool precision = true;
 
-        // Compteurs remplis par le crochet (même fil que le reste, pas besoin de verrou).
-        bool physEnAttente;
-        int dernierPhys, physBloques, physRecus, injEnvoyes, injVus;
+        // ----- fil de l'interface -----
+        readonly System.Windows.Forms.Timer minuteDessin = new System.Windows.Forms.Timer(), minuteGarde = new System.Windows.Forms.Timer();
+        readonly Apparence[] apparences = new Apparence[5];
+        ImageCurseur fleche;
+        int version;
 
         public event Action Change;
         public event Action<string> Message;
@@ -90,77 +127,179 @@ namespace OrdinateurAPlusieurs
         public Moteur(Reglages r)
         {
             reglages = r;
-            proc = Crochet;
+            procSouris = CrochetSouris;
+            procClavier = CrochetClavier;
         }
 
-        public bool EnPause { get { return pause; } }
-
-        // ---------- démarrage / arrêt ----------
+        // =====================================================================
+        // Démarrage / arrêt
+        // =====================================================================
 
         public void Demarrer()
         {
-            brut = Marshal.AllocHGlobal(256);
-            taille = reglages.Taille * Natif.Echelle();
+            ui = SynchronizationContext.Current;
+            fleche = Dessin.FlecheWindows();
             LireReglagesWindows();
-            fenetre = new FenetreBrute(this);
-            RAWINPUTDEVICE[] d = new RAWINPUTDEVICE[1];
-            d[0].usUsagePage = 1; d[0].usUsage = 2;      // souris
-            d[0].dwFlags = 0x00000100 | 0x00002000;      // RIDEV_INPUTSINK | RIDEV_DEVNOTIFY
-            d[0].hwndTarget = fenetre.Handle;
-            if (!Natif.RegisterRawInputDevices(d, 1, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE))))
-                throw new Exception("Windows refuse de donner la liste des souris (RegisterRawInputDevices : " + Marshal.GetLastWin32Error() + ").");
-            crochet = Natif.SetWindowsHookEx(14, proc, Natif.GetModuleHandle(null), 0); // WH_MOUSE_LL
-            if (crochet == IntPtr.Zero)
-                throw new Exception("Impossible d'écouter la souris (SetWindowsHookEx : " + Marshal.GetLastWin32Error() + ").");
-            if (!Natif.RegisterHotKey(fenetre.Handle, 1, 0x0002 | 0x0001 | 0x4000, 0x7B)) // Ctrl+Alt+F12, sans répétition
-                Journal.Ecrire("Raccourci Ctrl+Alt+F12 déjà pris par un autre programme.");
-            minuteDessin.Interval = 15; minuteDessin.Tick += delegate { DessinerEnRetard(); }; minuteDessin.Start();
+            brut = Marshal.AllocHGlobal(256);
+
+            using (ManualResetEvent pret = new ManualResetEvent(false))
+            {
+                filCrochets = new Thread(delegate ()
+                {
+                    fenCrochets = new FenetreFil("crochets", TraiterCrochets);
+                    InstallerCrochets();
+                    pret.Set();
+                    Application.Run();
+                    if (crochetSouris != IntPtr.Zero) Natif.UnhookWindowsHookEx(crochetSouris);
+                    if (crochetClavier != IntPtr.Zero) Natif.UnhookWindowsHookEx(crochetClavier);
+                    fenCrochets.DestroyHandle();
+                });
+                filCrochets.IsBackground = true;
+                filCrochets.Priority = ThreadPriority.Highest;
+                filCrochets.SetApartmentState(ApartmentState.STA);
+                filCrochets.Start();
+                pret.WaitOne(5000);
+                if (crochetSouris == IntPtr.Zero) throw new Exception("Impossible d'écouter la souris (SetWindowsHookEx).");
+            }
+
+            string erreur = null;
+            using (ManualResetEvent pret = new ManualResetEvent(false))
+            {
+                filEntrees = new Thread(delegate ()
+                {
+                    fenEntrees = new FenetreFil("entrées", TraiterEntrees);
+                    RAWINPUTDEVICE[] d = new RAWINPUTDEVICE[2];
+                    d[0].usUsagePage = 1; d[0].usUsage = 2; d[0].dwFlags = 0x00000100 | 0x00002000; d[0].hwndTarget = fenEntrees.Handle; // souris
+                    d[1].usUsagePage = 1; d[1].usUsage = 6; d[1].dwFlags = 0x00000100 | 0x00002000; d[1].hwndTarget = fenEntrees.Handle; // claviers
+                    if (!Natif.RegisterRawInputDevices(d, 2, (uint)Marshal.SizeOf(typeof(RAWINPUTDEVICE))))
+                        erreur = "Windows refuse de donner la liste des souris et des claviers (" + Marshal.GetLastWin32Error() + ").";
+                    if (!Natif.RegisterHotKey(fenEntrees.Handle, 1, 0x0002 | 0x0001 | 0x4000, 0x7B)) // Ctrl+Alt+F12
+                        Journal.Ecrire("Raccourci Ctrl+Alt+F12 déjà pris par un autre programme.");
+                    pret.Set();
+                    if (erreur != null) return;
+                    Application.Run();
+                    Natif.UnregisterHotKey(fenEntrees.Handle, 1);
+                    fenEntrees.DestroyHandle();
+                });
+                filEntrees.IsBackground = true;
+                filEntrees.Priority = ThreadPriority.AboveNormal;
+                filEntrees.SetApartmentState(ApartmentState.STA);
+                filEntrees.Start();
+                pret.WaitOne(5000);
+            }
+            if (erreur != null) throw new Exception(erreur);
+
+            minuteDessin.Interval = 10; minuteDessin.Tick += delegate { Dessiner(); }; minuteDessin.Start();
             minuteGarde.Interval = 250; minuteGarde.Tick += delegate { Garde(); }; minuteGarde.Start();
-            minuteRetour.Tick += delegate { minuteRetour.Stop(); if (emprunteur != null && emprunteur.Boutons == 0) Rendre(); };
-            Journal.Ecrire("Démarré (échelle " + Natif.Echelle() + ").");
+            Journal.Ecrire("Démarré, version " + Programme.Version + ", échelle " + Natif.Echelle() + ", flèche Windows " +
+                (fleche != null ? fleche.L + "x" + fleche.H : "illisible") + ".");
         }
 
         public void Arreter()
         {
-            minuteDessin.Stop(); minuteGarde.Stop(); minuteRetour.Stop();
-            Rendre();
-            if (crochet != IntPtr.Zero) { Natif.UnhookWindowsHookEx(crochet); crochet = IntPtr.Zero; }
-            if (fenetre != null) { Natif.UnregisterHotKey(fenetre.Handle, 1); fenetre.DestroyHandle(); fenetre = null; }
-            for (int i = 1; i <= 4; i++) if (places[i] != null && places[i].Calque != null) places[i].Calque.Detruire();
-            if (brut != IntPtr.Zero) { Marshal.FreeHGlobal(brut); brut = IntPtr.Zero; }
+            minuteDessin.Stop(); minuteGarde.Stop();
+            lock (verrou)
+            {
+                bloquerSouris = bloquerClavier = false;
+                if (porteur != null) RelacherTout(porteur);
+            }
+            if (fenEntrees != null) Natif.PostMessage(fenEntrees.Handle, WM_APP_FIN, IntPtr.Zero, IntPtr.Zero);
+            if (fenCrochets != null) Natif.PostMessage(fenCrochets.Handle, WM_APP_FIN, IntPtr.Zero, IntPtr.Zero);
+            if (filEntrees != null) filEntrees.Join(2000);
+            if (filCrochets != null) filCrochets.Join(2000);
+            for (int i = 1; i <= 4; i++) if (places[i] != null) DetruireDessins(places[i]);
+            foreach (Joueur j in retires) DetruireDessins(j);
             Journal.Ecrire("Arrêté.");
         }
 
-        // ---------- crochet : bloque les vraies souris quand il y a plusieurs joueurs ----------
+        // =====================================================================
+        // Fil des crochets : décider vite, bloquer ou laisser passer
+        // =====================================================================
 
-        IntPtr Crochet(int n, IntPtr w, IntPtr l)
+        void TraiterCrochets(ref Message m)
+        {
+            if (m.Msg == WM_APP_REINSTALLER) InstallerCrochets();
+            else if (m.Msg == WM_APP_FIN) Application.ExitThread();
+        }
+
+        void InstallerCrochets()
+        {
+            if (crochetSouris != IntPtr.Zero) Natif.UnhookWindowsHookEx(crochetSouris);
+            if (crochetClavier != IntPtr.Zero) Natif.UnhookWindowsHookEx(crochetClavier);
+            IntPtr mod = Natif.GetModuleHandle(null);
+            crochetSouris = Natif.SetWindowsHookEx(14, procSouris, mod, 0);   // WH_MOUSE_LL
+            crochetClavier = Natif.SetWindowsHookEx(13, procClavier, mod, 0); // WH_KEYBOARD_LL
+        }
+
+        IntPtr CrochetSouris(int n, IntPtr w, IntPtr l)
         {
             if (n >= 0)
             {
-                MSLLHOOKSTRUCT s = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(l, typeof(MSLLHOOKSTRUCT));
-                long extra = s.dwExtraInfo.ToInt64();
-                if (extra == MARQUE) injVus++;
+                uint flags = (uint)Marshal.ReadInt32(l, 12);
+                long extra = Marshal.ReadIntPtr(l, decalageExtraSouris).ToInt64();
+                if (extra == MARQUE) Interlocked.Increment(ref injVus);
                 // Geste d'une vraie souris (pas envoyé par un programme, pas un doigt ni un stylet)
-                else if ((s.flags & 1) == 0 && ((uint)extra & 0xFFFFFF00u) != 0xFF515700u)
+                else if (((flags & 1) == 0 && ((uint)extra & 0xFFFFFF00u) != 0xFF515700u) || (Essai && (extra == 0x7771 || extra == 0x7772)))
                 {
-                    physEnAttente = true;
+                    Interlocked.Increment(ref crochetPhys);
                     dernierPhys = Environment.TickCount;
-                    if (actif) { physBloques++; return new IntPtr(1); }
+                    physEnAttente = true;
+                    if (bloquerSouris) { Interlocked.Increment(ref crochetPhysBloques); return new IntPtr(1); }
                 }
             }
-            return Natif.CallNextHookEx(crochet, n, w, l);
+            return Natif.CallNextHookEx(IntPtr.Zero, n, w, l);
         }
 
-        // ---------- Raw Input : qui a bougé ? ----------
+        IntPtr CrochetClavier(int n, IntPtr w, IntPtr l)
+        {
+            if (n >= 0)
+            {
+                uint vk = (uint)Marshal.ReadInt32(l, 0), scan = (uint)Marshal.ReadInt32(l, 4), flags = (uint)Marshal.ReadInt32(l, 8);
+                long extra = Marshal.ReadIntPtr(l, 16).ToInt64();
+                if (extra == MARQUE) Interlocked.Increment(ref injVus);
+                // Vraie touche ; on laisse passer le faux Ctrl d'AltGr (0x21D) et les touches multimédia (volume...).
+                else if ((flags & 0x10) == 0 && (scan & 0x200) == 0 && !(vk >= 0xA6 && vk <= 0xB7) && vk != 0x5F)
+                {
+                    if (bloquerClavier)
+                    {
+                        if (clavAttente == 0) clavAttente = Environment.TickCount | 1;
+                        return new IntPtr(1);
+                    }
+                }
+            }
+            return Natif.CallNextHookEx(IntPtr.Zero, n, w, l);
+        }
 
-        public void SurBrut(IntPtr h)
+        // =====================================================================
+        // Fil de Raw Input : qui a fait quoi, et que faut-il renvoyer à Windows
+        // =====================================================================
+
+        void TraiterEntrees(ref Message m)
+        {
+            if (m.Msg == 0x00FF) SurBrut(m.LParam);                                           // WM_INPUT
+            else if (m.Msg == 0x00FE && m.WParam.ToInt64() == 2) SurDebranche(m.LParam);      // WM_INPUT_DEVICE_CHANGE (retrait)
+            else if (m.Msg == 0x0312) BasculerPause();                                        // WM_HOTKEY
+            else if (m.Msg == WM_APP_FIN) Application.ExitThread();
+        }
+
+        void SurBrut(IntPtr h)
         {
             uint entete = (uint)(8 + 2 * IntPtr.Size), lg = 256;
             uint lu = Natif.GetRawInputData(h, 0x10000003, brut, ref lg, entete); // RID_INPUT
-            if (lu == uint.MaxValue || lu < entete + 24) return;
-            if (Marshal.ReadInt32(brut) != 0) return; // pas une souris
+            if (lu == uint.MaxValue || lu < entete + 16) return;
+            int type = Marshal.ReadInt32(brut);
             IntPtr dev = Marshal.ReadIntPtr(brut, 8);
-            int o = (int)entete;
+            lock (verrou)
+            {
+                if (type == 0 && lu >= entete + 24) SourisBrute(dev, (int)entete);
+                else if (type == 1) ClavierBrut(dev, (int)entete);
+            }
+        }
+
+        // ---------------- souris ----------------
+
+        void SourisBrute(IntPtr dev, int o)
+        {
             int drapeaux = (ushort)Marshal.ReadInt16(brut, o);
             int btn = (ushort)Marshal.ReadInt16(brut, o + 4);
             short donnee = Marshal.ReadInt16(brut, o + 6);
@@ -169,18 +308,20 @@ namespace OrdinateurAPlusieurs
             if (extra == (uint)MARQUE || (extra & 0xFFFFFF00u) == 0xFF515700u) return; // nous-mêmes, ou un écran tactile
 
             string cle;
-            if (dev == IntPtr.Zero)
+            if (dev == IntPtr.Zero && Essai && (extra == 0x7771 || extra == 0x7772)) cle = "ESSAI-" + (extra & 0xF);
+            else if (dev == IntPtr.Zero)
             {
-                // Sans poignée : soit un programme qui simule la souris (on l'ignore), soit un pavé
-                // tactile « de précision », que l'on reconnaît parce que le crochet vient d'en voir passer un geste.
+                // Sans poignée : un programme qui simule la souris (ignoré), ou un pavé tactile « de précision »,
+                // reconnu parce que le crochet vient d'en voir passer un vrai geste.
                 if (!physEnAttente || Environment.TickCount - dernierPhys > 60) return;
                 cle = "PAVE-TACTILE";
             }
             else cle = CleDe(dev);
             physEnAttente = false;
-            physRecus++;
+            Interlocked.Increment(ref brutPhys);
+            evtsSouris++;
 
-            bool absolu = (drapeaux & 1) != 0;
+            bool absolu = (drapeaux & 1) != 0, bureau = (drapeaux & 2) != 0;
             bool etaitActif = actif;
             Joueur j;
             if (!parCle.TryGetValue(cle, out j))
@@ -189,58 +330,328 @@ namespace OrdinateurAPlusieurs
                 bool geste = (btn & 0x0D55) != 0 || absolu || Math.Abs(dx) + Math.Abs(dy) >= 2;
                 if (!geste) return;
                 j = NouveauJoueur(cle);
-                if (j == null) j = maitre; // déjà 4 joueurs : la souris en trop suit le joueur principal
+                if (j == null) j = porteur != null ? porteur : Premier(); // déjà 4 joueurs : la souris en trop suit le porteur
                 if (j == null) return;
             }
             j.DerniereActivite = Environment.TickCount;
             double t = chrono.Elapsed.TotalMilliseconds;
-            if (!etaitActif) { j.DernierEvt = t; return; } // mode normal : Windows a déjà tout fait
+            bool bouge = absolu || dx != 0 || dy != 0;
+            if (!etaitActif)
+            {
+                // Mode normal : Windows a déjà tout fait.
+                if (bouge) Agiter(j, Math.Abs(dx) + Math.Abs(dy), t);
+                j.DernierEvt = t;
+                if ((btn & 0x0155) != 0) j.DernierBouton = t;
+                return;
+            }
 
             // 1) mouvement
-            if (absolu || dx != 0 || dy != 0)
+            if (bouge)
             {
-                if (j == maitre && emprunteur == null)
-                {
-                    uint f = 0x0001; // MOVE
-                    if (absolu) f |= 0x8000 | ((drapeaux & 2) != 0 ? 0x4000u : 0u); // ABSOLUTE (| VIRTUALDESK)
-                    Injecter(f, dx, dy, 0);
-                }
+                if (j == porteur) DeplacerVrai(j, absolu, bureau, dx, dy);
                 else
                 {
-                    Avancer(j, absolu, (drapeaux & 2) != 0, dx, dy, t);
-                    if (j == emprunteur) PoserVraiCurseur(j);
+                    Avancer(j, absolu, bureau, dx, dy, t);
+                    if (porteur == null || (porteur.Boutons == 0 && !Occupe(porteur, t) && t - porteur.DernierBouton > PASSAGE_MS))
+                        Prendre(j);
                 }
+                Agiter(j, Math.Abs(dx) + Math.Abs(dy), t);
             }
             j.DernierEvt = t;
 
             // 2) boutons et molettes
             if (btn != 0)
             {
-                Bouton(j, btn, 0x0001, 0x0002, 1, 0x0002, 0x0004, 0); // gauche
-                Bouton(j, btn, 0x0004, 0x0008, 2, 0x0008, 0x0010, 0); // droit
-                Bouton(j, btn, 0x0010, 0x0020, 4, 0x0020, 0x0040, 0); // milieu
-                Bouton(j, btn, 0x0040, 0x0080, 8, 0x0080, 0x0100, 1); // côté 1
-                Bouton(j, btn, 0x0100, 0x0200, 16, 0x0080, 0x0100, 2); // côté 2
-                if ((btn & 0x0400) != 0) Molette(j, 0x0800, donnee);
-                if ((btn & 0x0800) != 0) Molette(j, 0x1000, donnee);
+                Bouton(j, btn, 0x0001, 0x0002, 1, 0x0002, 0x0004, 0, t); // gauche
+                Bouton(j, btn, 0x0004, 0x0008, 2, 0x0008, 0x0010, 0, t); // droit
+                Bouton(j, btn, 0x0010, 0x0020, 4, 0x0020, 0x0040, 0, t); // milieu
+                Bouton(j, btn, 0x0040, 0x0080, 8, 0x0080, 0x0100, 1, t); // côté 1
+                Bouton(j, btn, 0x0100, 0x0200, 16, 0x0080, 0x0100, 2, t); // côté 2
+                if ((btn & 0x0400) != 0) Molette(j, 0x0800, donnee, t);
+                if ((btn & 0x0800) != 0) Molette(j, 0x1000, donnee, t);
             }
         }
 
-        public void SurDebranche(IntPtr dev)
+        void Agiter(Joueur j, int quantite, double t)
         {
-            string cle;
-            if (!cles.TryGetValue(dev, out cle)) return;
-            cles.Remove(dev);
-            if (cles.ContainsValue(cle)) return; // une autre partie de la même souris est encore là
-            Joueur j;
-            if (parCle.TryGetValue(cle, out j))
+            j.Agitation = j.Agitation * Math.Exp(-(t - j.DernierMouvement) / 150.0) + quantite;
+            j.DernierMouvement = t;
+        }
+
+        /// Le porteur se sert-il vraiment de sa souris en ce moment ? (au-delà des secousses d'une main posée dessus)
+        bool Occupe(Joueur p, double t)
+        {
+            return p.Agitation * Math.Exp(-(t - p.DernierMouvement) / 150.0) > 15;
+        }
+
+        void Bouton(Joueur j, int btn, int brutAppui, int brutRelache, int bit, uint fAppui, uint fRelache, uint x, double t)
+        {
+            if ((btn & brutAppui) != 0)
             {
-                Journal.Ecrire("Souris débranchée : joueur " + j.Num);
-                Retirer(j);
+                if (j != porteur)
+                {
+                    if (porteur != null && porteur.Boutons != 0) return; // le porteur fait un glisser-déposer : on attend
+                    Prendre(j);
+                }
+                j.Boutons |= bit;
+                j.DernierBouton = t;
+                ChoisirEndroit(j);
+                Injecter(fAppui, 0, 0, x);
+            }
+            if ((btn & brutRelache) != 0)
+            {
+                if (j != porteur) return; // son appui avait été ignoré
+                j.Boutons &= ~bit;
+                j.DernierBouton = t;
+                Injecter(fRelache, 0, 0, x); // toujours renvoyé : un relâchement en trop ne fait aucun mal
             }
         }
 
-        /// Une souris = un appareil. Les souris « gamer » se présentent en plusieurs morceaux
+        void Molette(Joueur j, uint f, short delta, double t)
+        {
+            if (j != porteur)
+            {
+                if (porteur != null && porteur.Boutons != 0) return;
+                Prendre(j);
+            }
+            j.DernierBouton = t;
+            Injecter(f, 0, 0, unchecked((uint)delta));
+        }
+
+        /// Le vrai curseur de Windows passe chez ce joueur.
+        void Prendre(Joueur j)
+        {
+            if (porteur == j) return;
+            Joueur ancien = porteur;
+            if (ancien != null)
+            {
+                POINT p;
+                Natif.GetCursorPos(out p);
+                ancien.X = p.X; ancien.Y = p.Y;
+                ancien.ResteX = ancien.ResteY = 0;
+                ancien.Boutons = 0;
+            }
+            porteur = j;
+            j.ResteX = j.ResteY = 0;
+            int x = (int)Math.Round(j.X), y = (int)Math.Round(j.Y);
+            bool ok = Natif.SetCursorPos(x, y);
+            int err = ok ? 0 : Marshal.GetLastWin32Error();
+            Injecter(0x0001, 0, 0, 0); // « mouvement nul » : les fenêtres voient le curseur arriver (survol)
+            POINT apres;
+            Natif.GetCursorPos(out apres);
+            Journal.Ecrire("Vrai curseur -> joueur " + j.Num + " en " + x + "," + y + (ok ? "" : " (SetCursorPos refusé : " + err + ")") + ", arrivé en " + apres.X + "," + apres.Y);
+        }
+
+        /// Le porteur bouge : on renvoie son geste tel quel, Windows applique sa vitesse et son accélération.
+        void DeplacerVrai(Joueur j, bool absolu, bool bureau, int dx, int dy)
+        {
+            if (absolu) { Injecter(0x0001 | 0x8000 | (bureau ? 0x4000u : 0u), dx, dy, 0); return; }
+            double v = reglages.VitesseDe(j.Num);
+            if (Math.Abs(v - 1) < 0.01) { Injecter(0x0001, dx, dy, 0); return; }
+            j.ResteX += dx * v; j.ResteY += dy * v;
+            int ix = (int)j.ResteX, iy = (int)j.ResteY;
+            j.ResteX -= ix; j.ResteY -= iy;
+            if (ix != 0 || iy != 0) Injecter(0x0001, ix, iy, 0);
+        }
+
+        /// Déplace un curseur dessiné, avec une vitesse proche de celle de Windows.
+        void Avancer(Joueur j, bool absolu, bool bureau, int dx, int dy, double t)
+        {
+            if (absolu)
+            {
+                int vl = 0, vt = 0, vw = Natif.GetSystemMetrics(0), vh = Natif.GetSystemMetrics(1);
+                if (bureau) { vl = Natif.GetSystemMetrics(76); vt = Natif.GetSystemMetrics(77); vw = Natif.GetSystemMetrics(78); vh = Natif.GetSystemMetrics(79); }
+                j.X = vl + dx * (double)vw / 65536.0;
+                j.Y = vt + dy * (double)vh / 65536.0;
+            }
+            else
+            {
+                double gain = facteurWindows * reglages.VitesseDe(j.Num);
+                if (precision) // « Améliorer la précision du pointeur » : lent = précis, rapide = loin
+                {
+                    double dt = Math.Max(1.0, Math.Min(25.0, t - j.DernierEvt));
+                    double v = Math.Sqrt((double)dx * dx + (double)dy * dy) / dt;
+                    gain *= Math.Min(2.6, 0.4 + 0.25 * v);
+                }
+                j.X += dx * gain;
+                j.Y += dy * gain;
+            }
+            Borner(j);
+        }
+
+        /// Garde le curseur sur un écran (même avec plusieurs écrans de tailles différentes).
+        void Borner(Joueur j)
+        {
+            POINT p = new POINT((int)Math.Floor(j.X), (int)Math.Floor(j.Y));
+            if (Natif.MonitorFromPoint(p, 0) != IntPtr.Zero) return;
+            IntPtr ecran = Natif.MonitorFromPoint(p, 2); // le plus proche
+            MONITORINFO mi = new MONITORINFO();
+            mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+            if (!Natif.GetMonitorInfo(ecran, ref mi)) return;
+            j.X = Math.Max(mi.rcMonitor.Left, Math.Min(mi.rcMonitor.Right - 1, j.X));
+            j.Y = Math.Max(mi.rcMonitor.Top, Math.Min(mi.rcMonitor.Bottom - 1, j.Y));
+        }
+
+        void RelacherTout(Joueur j)
+        {
+            if ((j.Boutons & 1) != 0) Injecter(0x0004, 0, 0, 0);
+            if ((j.Boutons & 2) != 0) Injecter(0x0010, 0, 0, 0);
+            if ((j.Boutons & 4) != 0) Injecter(0x0040, 0, 0, 0);
+            if ((j.Boutons & 8) != 0) Injecter(0x0100, 0, 0, 1);
+            if ((j.Boutons & 16) != 0) Injecter(0x0100, 0, 0, 2);
+            j.Boutons = 0;
+        }
+
+        void Injecter(uint f, int dx, int dy, uint donnee)
+        {
+            tampon[0].type = 0;
+            tampon[0].mi.dx = dx; tampon[0].mi.dy = dy;
+            tampon[0].mi.mouseData = donnee; tampon[0].mi.dwFlags = f; tampon[0].mi.time = 0;
+            tampon[0].mi.dwExtraInfo = new IntPtr(MARQUE);
+            Natif.SendInput(1, tampon, tailleInput);
+            if (f != 1 || dx != 0 || dy != 0) Interlocked.Increment(ref injEnvoyes);
+        }
+
+        // ---------------- claviers ----------------
+
+        static IntPtr Racine(IntPtr h) { return h == IntPtr.Zero ? h : Natif.GetAncestor(h, 2); } // GA_ROOT
+
+        /// Un clic choisit l'endroit où écrira le clavier de ce joueur.
+        void ChoisirEndroit(Joueur j)
+        {
+            focus = j;
+            POINT p = new POINT((int)Math.Round(j.X), (int)Math.Round(j.Y));
+            Natif.GetCursorPos(out p);
+            j.Fenetre = Racine(Natif.WindowFromPoint(p));
+        }
+
+        void ClavierBrut(IntPtr dev, int o)
+        {
+            int make = (ushort)Marshal.ReadInt16(brut, o), fl = (ushort)Marshal.ReadInt16(brut, o + 2), vk = (ushort)Marshal.ReadInt16(brut, o + 6);
+            uint extra = (uint)Marshal.ReadInt32(brut, o + 12);
+            if (extra == (uint)MARQUE || dev == IntPtr.Zero) return; // nous-mêmes, ou un programme qui simule le clavier
+            clavAttente = 0;
+            if (vk == 0xFF || (vk >= 0xA6 && vk <= 0xB7) || vk == 0x5F) return; // touche fantôme, touches multimédia
+            evtsClavier++;
+            bool etaitRoute = clavierActif;
+            string cle = CleDe(dev);
+            Clavier c;
+            if (!claviers.TryGetValue(cle, out c))
+            {
+                c = new Clavier();
+                c.Cle = cle;
+                for (int n = 1; ; n++) { bool pris = false; foreach (Clavier k in claviers.Values) if (k.Num == n) pris = true; if (!pris) { c.Num = n; break; } }
+                claviers[cle] = c;
+                Journal.Ecrire("Nouveau clavier n°" + c.Num + " = " + cle);
+                MettreAJourMode();
+            }
+            bool appui = (fl & 1) == 0;
+            if (appui && c.Joueur == null && associerPour == null)
+            {
+                Joueur p = ChoisirPourClavier();
+                if (p != null) Associer(c, p);
+            }
+            if (!etaitRoute) return; // un seul clavier : Windows a déjà tout fait
+
+            if (!appui) { InjecterTouche(make, fl, vk, true); return; } // relâchement : toujours renvoyé
+            if (associerPour != null)
+            {
+                Joueur p = associerPour;
+                associerPour = null;
+                Associer(c, p);
+                Dire("Clavier n°" + c.Num + " associé au joueur " + p.Num + " (" + Dessin.NomCouleur(reglages.CouleurDe(p.Num)) + ").");
+                return; // la touche servait juste à choisir
+            }
+            Joueur j = c.Joueur;
+            if (j != null)
+            {
+                IntPtr premier = Racine(Natif.GetForegroundWindow());
+                if (j == focus) j.Fenetre = premier; // suit Alt+Tab et les fenêtres qui s'ouvrent
+                else if (focus == null || focus.Clavier == null || places[focus.Num] != focus)
+                {
+                    focus = j; j.Fenetre = premier; // l'endroit n'appartient à aucun autre clavier
+                }
+                else if (j.Fenetre != IntPtr.Zero && j.Fenetre != premier && Natif.IsWindow(j.Fenetre))
+                {
+                    Activer(j.Fenetre); // retourne à la fenêtre de ce joueur
+                    focus = j;
+                }
+                else return; // l'endroit choisi appartient à un autre joueur : ce clavier n'y écrit pas
+            }
+            InjecterTouche(make, fl, vk, false);
+        }
+
+        Joueur ChoisirPourClavier()
+        {
+            if (focus != null && focus.Clavier == null && places[focus.Num] == focus) return focus;
+            if (porteur != null && porteur.Clavier == null && places[porteur.Num] == porteur) return porteur;
+            for (int i = 1; i <= 4; i++) if (places[i] != null && places[i].Clavier == null) return places[i];
+            return null;
+        }
+
+        void Associer(Clavier c, Joueur j)
+        {
+            if (j.Clavier != null && j.Clavier != c) j.Clavier.Joueur = null;
+            if (c.Joueur != null && c.Joueur != j) c.Joueur.Clavier = null;
+            c.Joueur = j;
+            j.Clavier = c;
+            Journal.Ecrire("Clavier n°" + c.Num + " -> joueur " + j.Num);
+            Signaler();
+        }
+
+        void Activer(IntPtr h)
+        {
+            if (Natif.IsIconic(h)) Natif.ShowWindow(h, 9); // SW_RESTORE
+            // Un geste vide envoyé juste avant autorise SetForegroundWindow.
+            tampon[0].type = 0; tampon[0].mi.dx = 0; tampon[0].mi.dy = 0; tampon[0].mi.mouseData = 0; tampon[0].mi.dwFlags = 0;
+            tampon[0].mi.dwExtraInfo = new IntPtr(MARQUE);
+            Natif.SendInput(1, tampon, tailleInput);
+            if (Natif.SetForegroundWindow(h)) return;
+            uint autre = Natif.GetWindowThreadProcessId(Natif.GetForegroundWindow(), IntPtr.Zero), moi = Natif.GetCurrentThreadId();
+            if (autre == 0 || autre == moi) return;
+            Natif.AttachThreadInput(moi, autre, true);
+            Natif.SetForegroundWindow(h);
+            Natif.AttachThreadInput(moi, autre, false);
+        }
+
+        void InjecterTouche(int make, int fl, int vk, bool relache)
+        {
+            uint f = relache ? 2u : 0u;
+            if ((fl & 2) != 0) f |= 1; // touche « étendue » (préfixe E0)
+            tamponClavier[0].type = 1;
+            if (vk == 0x13 || make == 0) { tamponClavier[0].ki.wVk = (ushort)vk; tamponClavier[0].ki.wScan = 0; }
+            else { tamponClavier[0].ki.wVk = 0; tamponClavier[0].ki.wScan = (ushort)make; f |= 8; } // KEYEVENTF_SCANCODE : comme une vraie touche
+            tamponClavier[0].ki.dwFlags = f;
+            tamponClavier[0].ki.time = 0;
+            tamponClavier[0].ki.dwExtraInfo = new IntPtr(MARQUE);
+            Natif.SendInputClavier(1, tamponClavier, tailleInput);
+            Interlocked.Increment(ref injEnvoyes);
+        }
+
+        // ---------------- appareils ----------------
+
+        void SurDebranche(IntPtr dev)
+        {
+            lock (verrou)
+            {
+                string cle;
+                if (!cles.TryGetValue(dev, out cle)) return;
+                cles.Remove(dev);
+                if (cles.ContainsValue(cle)) return; // une autre partie du même appareil est encore là
+                Joueur j;
+                if (parCle.TryGetValue(cle, out j)) { Journal.Ecrire("Souris débranchée : joueur " + j.Num); Retirer(j); }
+                Clavier c;
+                if (claviers.TryGetValue(cle, out c))
+                {
+                    Journal.Ecrire("Clavier n°" + c.Num + " débranché.");
+                    if (c.Joueur != null) c.Joueur.Clavier = null;
+                    claviers.Remove(cle);
+                    MettreAJourMode();
+                }
+            }
+        }
+
+        /// Un appareil = une clé. Les souris « gamer » se présentent en plusieurs morceaux
         /// (MI_00, MI_01...) : on remonte jusqu'à l'appareil USB / Bluetooth commun.
         string CleDe(IntPtr dev)
         {
@@ -249,7 +660,7 @@ namespace OrdinateurAPlusieurs
             uint lg = 1024;
             StringBuilder sb = new StringBuilder(1024);
             string nom = Natif.GetRawInputDeviceInfo(dev, 0x20000007, sb, ref lg) < 0x7FFFFFFF ? sb.ToString() : ""; // RIDI_DEVICENAME
-            cle = nom.Length > 0 ? nom.ToUpperInvariant() : "H" + dev.ToInt64().ToString("X");
+            cle = "H" + dev.ToInt64().ToString("X");
             if (nom.Length > 0)
             {
                 string id = nom.StartsWith(@"\\?\") ? nom.Substring(4) : nom;
@@ -276,7 +687,22 @@ namespace OrdinateurAPlusieurs
             return cle;
         }
 
-        // ---------- joueurs ----------
+        // =====================================================================
+        // Joueurs et modes (sous verrou)
+        // =====================================================================
+
+        Joueur Premier()
+        {
+            for (int i = 1; i <= 4; i++) if (places[i] != null) return places[i];
+            return null;
+        }
+
+        int Nombre()
+        {
+            int n = 0;
+            for (int i = 1; i <= 4; i++) if (places[i] != null) n++;
+            return n;
+        }
 
         Joueur NouveauJoueur(string cle)
         {
@@ -286,308 +712,70 @@ namespace OrdinateurAPlusieurs
             Joueur j = new Joueur();
             j.Num = num; j.Cle = cle;
             j.DerniereActivite = Environment.TickCount;
-            j.DernierEvt = chrono.Elapsed.TotalMilliseconds;
+            j.DernierEvt = j.DernierMouvement = chrono.Elapsed.TotalMilliseconds;
             POINT p;
             Natif.GetCursorPos(out p);
-            if (maitre == null) { maitre = j; j.X = p.X; j.Y = p.Y; }
-            else { j.X = p.X + 70; j.Y = p.Y + 50; Borner(j); }
+            j.X = p.X; j.Y = p.Y;
+            if (Nombre() > 0) { j.X += 70; j.Y += 50; Borner(j); }
+            else porteur = j;
             places[num] = j;
             parCle[cle] = j;
-            Journal.Ecrire("Nouvelle souris : joueur " + num + (j == maitre ? " (principal)" : "") + " = " + cle);
+            Journal.Ecrire("Nouvelle souris : joueur " + num + " = " + cle);
             MettreAJourMode();
-            if (j != maitre && actif)
-                Dire("Joueur " + num + " (" + Dessin.NomsCouleurs[num] + ") : à toi de jouer !");
+            if (actif && j != porteur) Dire("Joueur " + num + " (" + Dessin.NomCouleur(reglages.CouleurDe(num)) + ") : à toi de jouer !");
             Signaler();
             return j;
         }
 
         void Retirer(Joueur j)
         {
-            if (j == emprunteur) Rendre();
-            if (j.Calque != null) { j.Calque.Detruire(); j.Calque = null; }
+            if (j == porteur) { RelacherTout(j); porteur = null; }
+            if (j == focus) focus = null;
+            if (j == associerPour) associerPour = null;
+            if (j.Clavier != null) { j.Clavier.Joueur = null; j.Clavier = null; }
             places[j.Num] = null;
             parCle.Remove(j.Cle);
-            if (j == maitre)
-            {
-                maitre = null;
-                for (int i = 1; i <= 4; i++) if (places[i] != null) { maitre = places[i]; break; }
-                if (maitre != null) PoserVraiCurseur(maitre);
-            }
+            retires.Add(j);
             MettreAJourMode();
-            foreach (Joueur p in Joueurs()) Dessiner(p, true);
             Signaler();
-        }
-
-        /// Oublie toutes les souris sauf celle du joueur principal.
-        public void Reinitialiser()
-        {
-            foreach (Joueur j in Joueurs()) if (j != maitre) Retirer(j);
-        }
-
-        List<Joueur> Joueurs()
-        {
-            List<Joueur> l = new List<Joueur>();
-            for (int i = 1; i <= 4; i++) if (places[i] != null) l.Add(places[i]);
-            return l;
         }
 
         void MettreAJourMode()
         {
-            bool nouveau = !pause && secours == null && Joueurs().Count >= 2;
-            if (nouveau == actif) return;
-            if (!nouveau) Rendre();
-            actif = nouveau;
-            if (actif && maitre != null)
+            bool nActif = !pause && secours == null && Nombre() >= 2;
+            if (nActif != actif)
             {
-                POINT p;
-                Natif.GetCursorPos(out p);
-                maitre.X = p.X; maitre.Y = p.Y;
+                for (int i = 1; i <= 4; i++) if (places[i] != null) places[i].Boutons = 0;
+                actif = nActif;
+                if (actif)
+                {
+                    if (porteur == null || places[porteur.Num] != porteur) porteur = Premier();
+                    if (porteur != null)
+                    {
+                        POINT p;
+                        Natif.GetCursorPos(out p);
+                        porteur.X = p.X; porteur.Y = p.Y;
+                    }
+                }
+                Journal.Ecrire(actif ? "Mode plusieurs souris." : "Mode normal" + (pause ? " (pause)." : secours != null ? " (secours : " + secours + ")." : "."));
             }
-            foreach (Joueur j in Joueurs()) Dessiner(j, true);
-            Journal.Ecrire(actif ? "Mode plusieurs souris." : "Mode normal" + (pause ? " (pause)." : secours != null ? " (secours : " + secours + ")." : "."));
+            clavierActif = actif && claviers.Count >= 2;
+            bloquerSouris = actif;
+            bloquerClavier = clavierActif;
+            if (!clavierActif) clavAttente = 0;
             Signaler();
         }
 
         public void BasculerPause()
         {
-            pause = !pause;
-            secours = null; secoursDefinitif = false;
-            MettreAJourMode();
-            Dire(pause ? "En pause : toutes les souris bougent le même curseur. Ctrl+Alt+F12 pour reprendre."
-                       : "C'est reparti : un curseur par souris.");
-            Signaler();
-        }
-
-        // ---------- gestes ----------
-
-        void Bouton(Joueur j, int btn, int brutAppui, int brutRelache, int bit, uint fAppui, uint fRelache, uint x)
-        {
-            if ((btn & brutAppui) != 0) Appui(j, bit, fAppui, x);
-            if ((btn & brutRelache) != 0) Relache(j, bit, fRelache, x);
-        }
-
-        void Appui(Joueur j, int bit, uint f, uint x)
-        {
-            if (j == maitre)
+            lock (verrou)
             {
-                if (emprunteur != null) return; // un autre joueur tient le vrai curseur en ce moment
-            }
-            else
-            {
-                if (!PrendreLaMain(j)) return;
-                minuteRetour.Stop();
-            }
-            j.Boutons |= bit;
-            Injecter(f, 0, 0, x);
-        }
-
-        void Relache(Joueur j, int bit, uint f, uint x)
-        {
-            if ((j.Boutons & bit) == 0) return; // son appui avait été ignoré
-            j.Boutons &= ~bit;
-            Injecter(f, 0, 0, x);
-            if (j == emprunteur && j.Boutons == 0) ProgrammerRetour(60);
-        }
-
-        void Molette(Joueur j, uint f, short delta)
-        {
-            if (j == maitre)
-            {
-                if (emprunteur == null) Injecter(f, 0, 0, unchecked((uint)delta));
-                return;
-            }
-            if (!PrendreLaMain(j)) return;
-            Injecter(f, 0, 0, unchecked((uint)delta));
-            if (j.Boutons == 0) ProgrammerRetour(250);
-        }
-
-        /// Le vrai curseur vient chez ce joueur (s'il est libre).
-        bool PrendreLaMain(Joueur j)
-        {
-            if (emprunteur == j) return true;
-            if (emprunteur != null) return false;
-            if (maitre != null && maitre.Boutons != 0) return false; // le joueur principal tient un bouton
-            if (maitre != null)
-            {
-                POINT p;
-                Natif.GetCursorPos(out p);
-                maitre.X = p.X; maitre.Y = p.Y;
-            }
-            emprunteur = j;
-            PoserVraiCurseur(j);
-            if (maitre != null) Dessiner(maitre, true);
-            return true;
-        }
-
-        /// Le vrai curseur retourne chez le joueur principal.
-        void Rendre()
-        {
-            minuteRetour.Stop();
-            if (emprunteur == null) return;
-            Joueur j = emprunteur;
-            // Sécurité : on ne laisse jamais un bouton enfoncé.
-            if ((j.Boutons & 1) != 0) Injecter(0x0004, 0, 0, 0);
-            if ((j.Boutons & 2) != 0) Injecter(0x0010, 0, 0, 0);
-            if ((j.Boutons & 4) != 0) Injecter(0x0040, 0, 0, 0);
-            if ((j.Boutons & 8) != 0) Injecter(0x0100, 0, 0, 1);
-            if ((j.Boutons & 16) != 0) Injecter(0x0100, 0, 0, 2);
-            j.Boutons = 0;
-            emprunteur = null;
-            if (maitre != null)
-            {
-                PoserVraiCurseur(maitre);
-                Dessiner(maitre, true);
-            }
-        }
-
-        void ProgrammerRetour(int ms)
-        {
-            minuteRetour.Stop();
-            minuteRetour.Interval = ms;
-            minuteRetour.Start();
-        }
-
-        void PoserVraiCurseur(Joueur j)
-        {
-            Natif.SetCursorPos((int)Math.Round(j.X), (int)Math.Round(j.Y));
-            Injecter(0x0001, 0, 0, 0); // petit « mouvement nul » pour que les fenêtres voient le curseur arriver
-        }
-
-        void Injecter(uint f, int dx, int dy, uint donnee)
-        {
-            tampon[0].type = 0;
-            tampon[0].mi.dx = dx; tampon[0].mi.dy = dy;
-            tampon[0].mi.mouseData = donnee; tampon[0].mi.dwFlags = f; tampon[0].mi.time = 0;
-            tampon[0].mi.dwExtraInfo = new IntPtr(MARQUE);
-            Natif.SendInput(1, tampon, tailleInput);
-            if (f != 1 || dx != 0 || dy != 0) injEnvoyes++;
-        }
-
-        /// Déplace un curseur dessiné, avec une vitesse proche de celle de Windows.
-        void Avancer(Joueur j, bool absolu, bool bureau, int dx, int dy, double t)
-        {
-            if (absolu)
-            {
-                int vl = 0, vt = 0, vw = Natif.GetSystemMetrics(0), vh = Natif.GetSystemMetrics(1);
-                if (bureau) { vl = Natif.GetSystemMetrics(76); vt = Natif.GetSystemMetrics(77); vw = Natif.GetSystemMetrics(78); vh = Natif.GetSystemMetrics(79); }
-                j.X = vl + dx * (double)vw / 65536.0;
-                j.Y = vt + dy * (double)vh / 65536.0;
-            }
-            else
-            {
-                double gain = facteurWindows * reglages.Vitesse;
-                if (precision) // « Améliorer la précision du pointeur » : lent = précis, rapide = loin
-                {
-                    double dt = Math.Max(1.0, Math.Min(25.0, t - j.DernierEvt));
-                    double v = Math.Sqrt((double)dx * dx + (double)dy * dy) / dt;
-                    gain *= Math.Min(2.6, 0.4 + 0.25 * v);
-                }
-                j.X += dx * gain;
-                j.Y += dy * gain;
-            }
-            Borner(j);
-            Dessiner(j, false);
-        }
-
-        /// Garde le curseur sur un écran (même avec plusieurs écrans de tailles différentes).
-        void Borner(Joueur j)
-        {
-            POINT p = new POINT((int)Math.Floor(j.X), (int)Math.Floor(j.Y));
-            if (Natif.MonitorFromPoint(p, 0) != IntPtr.Zero) return;
-            IntPtr ecran = Natif.MonitorFromPoint(p, 2); // le plus proche
-            MONITORINFO mi = new MONITORINFO();
-            mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
-            if (!Natif.GetMonitorInfo(ecran, ref mi)) return;
-            j.X = Math.Max(mi.rcMonitor.Left, Math.Min(mi.rcMonitor.Right - 1, j.X));
-            j.Y = Math.Max(mi.rcMonitor.Top, Math.Min(mi.rcMonitor.Bottom - 1, j.Y));
-        }
-
-        // ---------- dessin ----------
-
-        Bitmap ImageDe(int num)
-        {
-            if (images[num] == null) images[num] = Dessin.Curseur(num, taille);
-            return images[num];
-        }
-
-        void Dessiner(Joueur j, bool force)
-        {
-            bool visible = actif && (j != maitre || emprunteur != null);
-            if (!visible)
-            {
-                if (j.Calque != null) j.Calque.Cacher();
-                j.EnRetard = false;
-                return;
-            }
-            if (j.Calque == null)
-            {
-                j.Calque = new Calque("joueur " + j.Num);
-                j.Calque.Image(ImageDe(j.Num));
-            }
-            double t = chrono.Elapsed.TotalMilliseconds;
-            if (!force && j.Calque.Affiche && t - j.DernierDessin < 7) { j.EnRetard = true; return; }
-            j.DernierDessin = t;
-            j.EnRetard = false;
-            int m = Dessin.Pointe(taille);
-            j.Calque.Montrer((int)Math.Round(j.X) - m, (int)Math.Round(j.Y) - m);
-        }
-
-        void DessinerEnRetard()
-        {
-            for (int i = 1; i <= 4; i++) if (places[i] != null && places[i].EnRetard) Dessiner(places[i], true);
-        }
-
-        public void ChangerTaille()
-        {
-            taille = reglages.Taille * Natif.Echelle();
-            for (int i = 1; i <= 4; i++)
-            {
-                if (images[i] != null) { images[i].Dispose(); images[i] = null; }
-                if (places[i] != null && places[i].Calque != null) { places[i].Calque.Image(ImageDe(i)); Dessiner(places[i], true); }
-            }
-        }
-
-        // ---------- surveillance (4 fois par seconde) ----------
-
-        void Garde()
-        {
-            tours++;
-            // Fin du mode secours temporaire.
-            if (secours != null && !secoursDefinitif &&
-                (Natif.GetForegroundWindow() != secoursFenetre || Environment.TickCount - secoursDebut > 15000))
-            {
-                secours = null;
+                pause = !pause;
+                secours = null; secoursDefinitif = false;
                 MettreAJourMode();
             }
-            if (actif)
-            {
-                if (physBloques >= 30 && physRecus == 0)
-                {
-                    // Le crochet bloque une souris que Raw Input ne nous montre pas : on ne la laisse pas morte.
-                    Secours("souris non reconnue", true);
-                    Dire("Une souris n'est pas reconnue : retour au mode normal. Ctrl+Alt+F12 deux fois pour réessayer.");
-                }
-                else if (injEnvoyes >= 12 && injVus * 4 < injEnvoyes)
-                {
-                    // Windows ne laisse pas passer nos gestes : souvent une fenêtre « administrateur » au premier plan.
-                    Secours("fenêtre administrateur", false);
-                }
-            }
-            physBloques = physRecus = injEnvoyes = injVus = 0;
-
-            if (tours % 4 == 0) // chaque seconde
-            {
-                foreach (Joueur j in Joueurs())
-                {
-                    if (j != maitre && j != emprunteur && Environment.TickCount - j.DerniereActivite > OUBLI_MS)
-                    {
-                        Journal.Ecrire("Joueur " + j.Num + " oublié (souris immobile).");
-                        Retirer(j);
-                    }
-                    else if (j.Calque != null) j.Calque.Verifier();
-                }
-            }
-            if (tours % 16 == 0) LireReglagesWindows();
+            Dire(pause ? "En pause : toutes les souris et tous les claviers redeviennent normaux. Ctrl+Alt+F12 pour reprendre."
+                       : "C'est reparti : un curseur par souris, un clavier par joueur.");
         }
 
         void Secours(string raison, bool definitif)
@@ -599,6 +787,160 @@ namespace OrdinateurAPlusieurs
             MettreAJourMode();
         }
 
+        // =====================================================================
+        // Fil de l'interface : dessins et surveillance
+        // =====================================================================
+
+        Apparence ApparenceDe(int num)
+        {
+            if (apparences[num] == null)
+                apparences[num] = Dessin.Fabriquer(fleche, reglages.CouleurDe(num), reglages.TailleDe(num), num);
+            return apparences[num];
+        }
+
+        /// À appeler quand une couleur ou une taille change.
+        public void RefaireDessins()
+        {
+            for (int i = 1; i <= 4; i++) apparences[i] = null;
+            version++;
+        }
+
+        void DetruireDessins(Joueur j)
+        {
+            if (j.Calque != null) { j.Calque.Detruire(); j.Calque = null; }
+            if (j.Pastille != null) { j.Pastille.Detruire(); j.Pastille = null; }
+        }
+
+        void Dessiner()
+        {
+            Joueur[] js = new Joueur[5];
+            int[] xs = new int[5], ys = new int[5];
+            bool act;
+            Joueur port;
+            List<Joueur> morts;
+            lock (verrou)
+            {
+                act = actif;
+                port = porteur;
+                for (int i = 1; i <= 4; i++)
+                    if ((js[i] = places[i]) != null) { xs[i] = (int)Math.Round(js[i].X); ys[i] = (int)Math.Round(js[i].Y); }
+                morts = retires;
+                retires = new List<Joueur>();
+            }
+            foreach (Joueur m in morts) DetruireDessins(m);
+            POINT cur;
+            Natif.GetCursorPos(out cur);
+            for (int i = 1; i <= 4; i++)
+            {
+                Joueur j = js[i];
+                if (j == null) continue;
+                if (!act)
+                {
+                    if (j.Calque != null) j.Calque.Cacher();
+                    if (j.Pastille != null) j.Pastille.Cacher();
+                    continue;
+                }
+                Apparence a = ApparenceDe(i);
+                if (j.VersionDessin != version)
+                {
+                    if (j.Calque == null) j.Calque = new Calque("joueur " + i);
+                    if (j.Pastille == null) j.Pastille = new Calque("pastille " + i);
+                    j.Calque.Image(a.Image);
+                    j.Pastille.Image(a.Pastille);
+                    j.VersionDessin = version;
+                }
+                if (j == port)
+                {
+                    j.Calque.Cacher();
+                    j.Pastille.Montrer(cur.X + a.PastilleX, cur.Y + a.PastilleY);
+                }
+                else
+                {
+                    j.Pastille.Cacher();
+                    j.Calque.Montrer(xs[i] - a.Hx, ys[i] - a.Hy);
+                }
+            }
+        }
+
+        void Garde()
+        {
+            tours++;
+            int phys = Interlocked.Exchange(ref crochetPhys, 0), bloques = Interlocked.Exchange(ref crochetPhysBloques, 0);
+            int recus = Interlocked.Exchange(ref brutPhys, 0), envoyes = Interlocked.Exchange(ref injEnvoyes, 0), vus = Interlocked.Exchange(ref injVus, 0);
+            string avertir = null;
+            lock (verrou)
+            {
+                // Fin du mode secours temporaire.
+                if (secours != null && !secoursDefinitif &&
+                    (Natif.GetForegroundWindow() != secoursFenetre || Environment.TickCount - secoursDebut > 15000))
+                {
+                    secours = null;
+                    MettreAJourMode();
+                }
+                if (actif)
+                {
+                    if (recus >= 20 && phys == 0)
+                    {
+                        // Windows a débranché nos crochets (ou une fenêtre administrateur est devant) : on les remet.
+                        Journal.Ecrire("Crochets silencieux (" + recus + " gestes reçus) : réinstallation.");
+                        Natif.PostMessage(fenCrochets.Handle, WM_APP_REINSTALLER, IntPtr.Zero, IntPtr.Zero);
+                        Secours("crochets à réinstaller", false);
+                    }
+                    else if (bloques >= 30 && recus == 0)
+                    {
+                        Secours("souris non reconnue", true);
+                        avertir = "Une souris n'est pas reconnue : retour au mode normal. Ctrl+Alt+F12 deux fois pour réessayer.";
+                    }
+                    else if (envoyes >= 12 && vus * 4 < envoyes)
+                    {
+                        Secours("fenêtre administrateur", false); // Windows ne laisse pas passer nos gestes
+                    }
+                    else if (clavierActif && clavAttente != 0 && Environment.TickCount - clavAttente > 600)
+                    {
+                        Secours("clavier non reconnu", true);
+                        avertir = "Un clavier n'est pas reconnu : retour au mode normal. Ctrl+Alt+F12 deux fois pour réessayer.";
+                    }
+                    // Sécurité : un bouton « tenu » sans aucune nouvelle de la souris depuis 4 s est relâché.
+                    if (porteur != null && porteur.Boutons != 0 && chrono.Elapsed.TotalMilliseconds - porteur.DernierEvt > 4000)
+                    {
+                        Journal.Ecrire("Bouton du joueur " + porteur.Num + " relâché par sécurité.");
+                        RelacherTout(porteur);
+                    }
+                }
+                if (tours % 4 == 0)
+                {
+                    for (int i = 1; i <= 4; i++)
+                    {
+                        Joueur j = places[i];
+                        if (j != null && j != porteur && Environment.TickCount - j.DerniereActivite > OUBLI_MS)
+                        {
+                            Journal.Ecrire("Joueur " + j.Num + " oublié (souris immobile).");
+                            Retirer(j);
+                        }
+                    }
+                }
+                if (tours % 20 == 0 && actif && (evtsSouris > 0 || evtsClavier > 0))
+                {
+                    Journal.Ecrire("5 s : " + evtsSouris + " gestes souris, " + evtsClavier + " touches, porteur = joueur " +
+                        (porteur != null ? porteur.Num.ToString() : "-") + ", clavier " + (clavierActif ? "par joueur" : "partagé") + ".");
+                }
+                if (tours % 20 == 0) { evtsSouris = 0; evtsClavier = 0; }
+            }
+            if (avertir != null) Dire(avertir);
+            if (tours % 4 == 0)
+                for (int i = 1; i <= 4; i++)
+                {
+                    Joueur j = places[i];
+                    if (j != null) { if (j.Calque != null) j.Calque.Verifier(); if (j.Pastille != null) j.Pastille.Verifier(); }
+                }
+            if (tours % 8 == 0)
+            {
+                ImageCurseur f = Dessin.FlecheWindows();
+                if (f != null && !f.MemesPixels(fleche)) { fleche = f; RefaireDessins(); Journal.Ecrire("La flèche de Windows a changé."); }
+            }
+            if (tours % 16 == 0) LireReglagesWindows();
+        }
+
         void LireReglagesWindows()
         {
             int v = 10;
@@ -607,26 +949,77 @@ namespace OrdinateurAPlusieurs
             if (Natif.SystemParametersInfo(0x0003, 0, souris, 0)) precision = souris[2] != 0; // SPI_GETMOUSE
         }
 
-        // ---------- état pour le menu ----------
+        // =====================================================================
+        // Pour le menu
+        // =====================================================================
+
+        public bool EnPause { get { return pause; } }
 
         public string Etat()
         {
-            List<Joueur> l = Joueurs();
-            if (pause) return "En pause (Ctrl+Alt+F12 pour reprendre)";
-            if (secours != null) return "Mode normal : " + secours;
-            if (l.Count < 2) return "Une seule souris : bouge une 2e souris !";
-            return l.Count + " souris, " + l.Count + " curseurs";
+            lock (verrou)
+            {
+                int n = Nombre();
+                if (pause) return "En pause (Ctrl+Alt+F12 pour reprendre)";
+                if (secours != null) return "Mode normal : " + secours;
+                if (n < 2) return "Une seule souris : bouge une 2e souris !";
+                return n + " souris, " + claviers.Count + " clavier" + (claviers.Count > 1 ? "s" : "") + (clavierActif ? " (un par joueur)" : " (partagé)");
+            }
         }
 
-        public List<string> Details()
+        public sealed class Info { public int Num; public bool Porteur; public int Clavier; public bool AttendClavier; }
+
+        public List<Info> Joueurs()
         {
-            List<string> r = new List<string>();
-            foreach (Joueur j in Joueurs())
-                r.Add("Joueur " + j.Num + " : curseur " + Dessin.NomsCouleurs[j.Num] + (j == maitre ? " (vrai curseur de Windows)" : ""));
-            return r;
+            List<Info> l = new List<Info>();
+            lock (verrou)
+                for (int i = 1; i <= 4; i++)
+                    if (places[i] != null)
+                    {
+                        Info f = new Info();
+                        f.Num = i;
+                        f.Porteur = places[i] == porteur && actif;
+                        f.Clavier = places[i].Clavier != null ? places[i].Clavier.Num : 0;
+                        f.AttendClavier = associerPour == places[i];
+                        l.Add(f);
+                    }
+            return l;
         }
 
-        void Signaler() { if (Change != null) Change(); }
-        void Dire(string s) { if (Message != null) Message(s); }
+        public void ChoisirClavier(int num)
+        {
+            lock (verrou) associerPour = places[num];
+            Dire("Joueur " + num + " : appuie sur une touche de ton clavier.");
+        }
+
+        public void EnleverClavier(int num)
+        {
+            lock (verrou)
+            {
+                Joueur j = places[num];
+                if (j != null && j.Clavier != null) { j.Clavier.Joueur = null; j.Clavier = null; }
+            }
+            Signaler();
+        }
+
+        /// Oublie toutes les souris sauf celle qui a le vrai curseur.
+        public void Reinitialiser()
+        {
+            lock (verrou)
+            {
+                Joueur garde = porteur != null ? porteur : Premier();
+                for (int i = 1; i <= 4; i++) if (places[i] != null && places[i] != garde) Retirer(places[i]);
+            }
+        }
+
+        void Signaler()
+        {
+            if (Change != null && ui != null) ui.Post(delegate { if (Change != null) Change(); }, null);
+        }
+
+        void Dire(string s)
+        {
+            if (Message != null && ui != null) ui.Post(delegate { if (Message != null) Message(s); }, null);
+        }
     }
 }
