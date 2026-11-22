@@ -12,7 +12,7 @@ namespace OrdinateurAPlusieurs
     static class Programme
     {
         public const string Nom = "Ordinateur à plusieurs";
-        public const string Version = "1.1.0";
+        public const string Version = "1.2.0";
 
         [STAThread]
         static void Main(string[] args)
@@ -221,6 +221,7 @@ namespace OrdinateurAPlusieurs
         {
             minuteQuitter.Stop();
             moteur.Arreter();
+            Journal.Vider();
             icone.Visible = false;
             icone.Dispose();
             base.ExitThreadCore();
@@ -299,27 +300,49 @@ namespace OrdinateurAPlusieurs
     }
 
     /// Journal de dépannage : dans le dossier des réglages si journal=1,
-    /// ou à côté de l'exe si un fichier « journal.on » s'y trouve.
+    /// ou à côté de l'exe si un fichier « journal.on » s'y trouve. L'écriture se fait dans un fil à part
+    /// pour ne jamais ralentir la souris.
     static class Journal
     {
         public static bool Actif;
-        static readonly object verrou = new object();
         static readonly string aCote = Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "journal.txt");
         static readonly bool aCoteActif = File.Exists(Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "journal.on"));
+        static readonly System.Collections.Concurrent.BlockingCollection<string> file = new System.Collections.Concurrent.BlockingCollection<string>();
+        static Thread fil;
 
         public static void Ecrire(string s)
         {
             if (!Actif && !aCoteActif) return;
-            try
+            file.Add(DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s);
+            lock (file)
+                if (fil == null)
+                {
+                    fil = new Thread(Boucle);
+                    fil.IsBackground = true;
+                    fil.Priority = ThreadPriority.BelowNormal;
+                    fil.Start();
+                }
+        }
+
+        /// Attend (au plus 1 s) que tout soit écrit : à la fermeture.
+        public static void Vider()
+        {
+            for (int i = 0; i < 20 && file.Count > 0; i++) Thread.Sleep(50);
+            Thread.Sleep(50);
+        }
+
+        static void Boucle()
+        {
+            string chemin = aCoteActif ? aCote : Path.Combine(Reglages.Dossier, "journal.txt");
+            foreach (string ligne in file.GetConsumingEnumerable())
             {
-                string chemin = aCoteActif ? aCote : Path.Combine(Reglages.Dossier, "journal.txt");
-                lock (verrou)
+                try
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(chemin));
-                    File.AppendAllText(chemin, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + s + Environment.NewLine);
+                    File.AppendAllText(chemin, ligne + Environment.NewLine);
                 }
+                catch { }
             }
-            catch { }
         }
     }
 }

@@ -111,15 +111,21 @@ namespace OrdinateurAPlusieurs
         bool actif, clavierActif, pause, secoursDefinitif;
         string secours;
         IntPtr secoursFenetre;
-        int secoursDebut, tours, evtsSouris, evtsClavier;
+        int secoursDebut, tours, evtsSouris, evtsClavier, passages;
+        double dernierPassage, maxRetard, maxEnvoi;
         double facteurWindows = 1;
         bool precision = true;
 
         // ----- fil de l'interface -----
-        readonly System.Windows.Forms.Timer minuteDessin = new System.Windows.Forms.Timer(), minuteGarde = new System.Windows.Forms.Timer();
-        readonly Apparence[] apparences = new Apparence[5];
-        ImageCurseur fleche;
+        readonly System.Windows.Forms.Timer minuteGarde = new System.Windows.Forms.Timer();
+        volatile ImageCurseur fleche;
         int version;
+
+        // ----- fil du dessin (calé sur l'affichage de l'écran) -----
+        Thread filDessin;
+        volatile bool finDessin;
+        readonly Apparence[] apparences = new Apparence[5];
+        int versionVue = -1;
 
         public event Action Change;
         public event Action<string> Message;
@@ -189,7 +195,11 @@ namespace OrdinateurAPlusieurs
             }
             if (erreur != null) throw new Exception(erreur);
 
-            minuteDessin.Interval = 10; minuteDessin.Tick += delegate { Dessiner(); }; minuteDessin.Start();
+            filDessin = new Thread(BoucleDessin);
+            filDessin.IsBackground = true;
+            filDessin.Priority = ThreadPriority.AboveNormal;
+            filDessin.SetApartmentState(ApartmentState.STA);
+            filDessin.Start();
             minuteGarde.Interval = 250; minuteGarde.Tick += delegate { Garde(); }; minuteGarde.Start();
             Journal.Ecrire("Démarré, version " + Programme.Version + ", échelle " + Natif.Echelle() + ", flèche Windows " +
                 (fleche != null ? fleche.L + "x" + fleche.H : "illisible") + ".");
@@ -197,7 +207,7 @@ namespace OrdinateurAPlusieurs
 
         public void Arreter()
         {
-            minuteDessin.Stop(); minuteGarde.Stop();
+            minuteGarde.Stop();
             lock (verrou)
             {
                 bloquerSouris = bloquerClavier = false;
@@ -207,8 +217,8 @@ namespace OrdinateurAPlusieurs
             if (fenCrochets != null) Natif.PostMessage(fenCrochets.Handle, WM_APP_FIN, IntPtr.Zero, IntPtr.Zero);
             if (filEntrees != null) filEntrees.Join(2000);
             if (filCrochets != null) filCrochets.Join(2000);
-            for (int i = 1; i <= 4; i++) if (places[i] != null) DetruireDessins(places[i]);
-            foreach (Joueur j in retires) DetruireDessins(j);
+            finDessin = true;
+            if (filDessin != null) filDessin.Join(2000);
             Journal.Ecrire("Arrêté.");
         }
 
@@ -289,8 +299,10 @@ namespace OrdinateurAPlusieurs
             if (lu == uint.MaxValue || lu < entete + 16) return;
             int type = Marshal.ReadInt32(brut);
             IntPtr dev = Marshal.ReadIntPtr(brut, 8);
+            int retard = Environment.TickCount - Natif.GetMessageTime();
             lock (verrou)
             {
+                if (retard > maxRetard && retard < 60000) maxRetard = retard;
                 if (type == 0 && lu >= entete + 24) SourisBrute(dev, (int)entete);
                 else if (type == 1) ClavierBrut(dev, (int)entete);
             }
@@ -348,14 +360,17 @@ namespace OrdinateurAPlusieurs
             // 1) mouvement
             if (bouge)
             {
+                Agiter(j, Math.Abs(dx) + Math.Abs(dy), t);
                 if (j == porteur) DeplacerVrai(j, absolu, bureau, dx, dy);
                 else
                 {
                     Avancer(j, absolu, bureau, dx, dy, t);
-                    if (porteur == null || (porteur.Boutons == 0 && !Occupe(porteur, t) && t - porteur.DernierBouton > PASSAGE_MS))
+                    // Le vrai curseur ne change de main que pour un vrai geste (pas un tremblement), quand le porteur
+                    // ne s'en sert plus, et pas plus d'une fois tous les 300 ms (sinon il sauterait sans arrêt entre deux joueurs).
+                    if (porteur == null || (porteur.Boutons == 0 && fileClics.Count == 0 && Agite(j, t) > SEUIL_GESTE
+                        && Agite(porteur, t) < SEUIL_OCCUPE && t - porteur.DernierBouton > PASSAGE_MS && t - dernierPassage > 300))
                         Prendre(j);
                 }
-                Agiter(j, Math.Abs(dx) + Math.Abs(dy), t);
             }
             j.DernierEvt = t;
 
@@ -372,38 +387,85 @@ namespace OrdinateurAPlusieurs
             }
         }
 
+        const double SEUIL_OCCUPE = 15, SEUIL_GESTE = 20;
+
         void Agiter(Joueur j, int quantite, double t)
         {
-            j.Agitation = j.Agitation * Math.Exp(-(t - j.DernierMouvement) / 150.0) + quantite;
+            j.Agitation = Agite(j, t) + quantite;
             j.DernierMouvement = t;
         }
 
-        /// Le porteur se sert-il vraiment de sa souris en ce moment ? (au-delà des secousses d'une main posée dessus)
-        bool Occupe(Joueur p, double t)
+        /// Quantité de mouvement récente (s'efface en ~150 ms) : une main simplement posée sur la souris reste sous 15.
+        static double Agite(Joueur p, double t)
         {
-            return p.Agitation * Math.Exp(-(t - p.DernierMouvement) / 150.0) > 15;
+            return p.Agitation * Math.Exp(-(t - p.DernierMouvement) / 150.0);
         }
+
+        /// Un clic qui attend son tour : le vrai curseur est occupé par le clic (ou le glisser-déposer) d'un autre joueur.
+        sealed class Clic
+        {
+            public Joueur J;
+            public int Bit;
+            public uint FAppui, FRelache, X;
+            public double PX, PY;
+            public bool Relache;
+        }
+
+        readonly List<Clic> fileClics = new List<Clic>();
 
         void Bouton(Joueur j, int btn, int brutAppui, int brutRelache, int bit, uint fAppui, uint fRelache, uint x, double t)
         {
             if ((btn & brutAppui) != 0)
             {
-                if (j != porteur)
-                {
-                    if (porteur != null && porteur.Boutons != 0) return; // le porteur fait un glisser-déposer : on attend
-                    Prendre(j);
-                }
-                j.Boutons |= bit;
                 j.DernierBouton = t;
-                ChoisirEndroit(j);
-                Injecter(fAppui, 0, 0, x);
+                if (j == porteur || porteur == null || (porteur.Boutons == 0 && fileClics.Count == 0))
+                {
+                    Prendre(j);
+                    j.Boutons |= bit;
+                    ChoisirEndroit(j);
+                    Injecter(fAppui, 0, 0, x);
+                }
+                else
+                {
+                    // Deux joueurs cliquent en même temps : ce clic passera dès que l'autre aura relâché.
+                    Clic c = new Clic();
+                    c.J = j; c.Bit = bit; c.FAppui = fAppui; c.FRelache = fRelache; c.X = x; c.PX = j.X; c.PY = j.Y;
+                    fileClics.Add(c);
+                }
             }
             if ((btn & brutRelache) != 0)
             {
-                if (j != porteur) return; // son appui avait été ignoré
-                j.Boutons &= ~bit;
                 j.DernierBouton = t;
+                foreach (Clic c in fileClics)
+                    if (c.J == j && c.Bit == bit && !c.Relache) { c.Relache = true; return; }
+                if (j != porteur) return;
+                j.Boutons &= ~bit;
                 Injecter(fRelache, 0, 0, x); // toujours renvoyé : un relâchement en trop ne fait aucun mal
+                if (j.Boutons == 0) TraiterFile();
+            }
+        }
+
+        /// Fait passer les clics en attente, l'un après l'autre, chacun à l'endroit où il a été fait.
+        void TraiterFile()
+        {
+            while (fileClics.Count > 0 && (porteur == null || porteur.Boutons == 0))
+            {
+                Clic c = fileClics[0];
+                fileClics.RemoveAt(0);
+                if (places[c.J.Num] != c.J) continue; // joueur parti entre-temps
+                double vx = c.J.X, vy = c.J.Y;
+                c.J.X = c.PX; c.J.Y = c.PY;
+                if (porteur == c.J) { Natif.SetCursorPos((int)Math.Round(c.PX), (int)Math.Round(c.PY)); Injecter(0x0001, 0, 0, 0); }
+                else Prendre(c.J);
+                ChoisirEndroit(c.J);
+                Injecter(c.FAppui, 0, 0, c.X);
+                if (c.Relache)
+                {
+                    Injecter(c.FRelache, 0, 0, c.X);
+                    c.J.X = vx; c.J.Y = vy; // puis le curseur rejoint l'endroit où ce joueur est allé depuis
+                    if (Math.Abs(vx - c.PX) >= 1 || Math.Abs(vy - c.PY) >= 1) { Natif.SetCursorPos((int)Math.Round(vx), (int)Math.Round(vy)); Injecter(0x0001, 0, 0, 0); }
+                }
+                else c.J.Boutons |= c.Bit; // il tient encore le bouton : glisser-déposer
             }
         }
 
@@ -411,7 +473,7 @@ namespace OrdinateurAPlusieurs
         {
             if (j != porteur)
             {
-                if (porteur != null && porteur.Boutons != 0) return;
+                if (porteur != null && (porteur.Boutons != 0 || fileClics.Count > 0)) return;
                 Prendre(j);
             }
             j.DernierBouton = t;
@@ -429,17 +491,14 @@ namespace OrdinateurAPlusieurs
                 Natif.GetCursorPos(out p);
                 ancien.X = p.X; ancien.Y = p.Y;
                 ancien.ResteX = ancien.ResteY = 0;
-                ancien.Boutons = 0;
+                if (ancien.Boutons != 0) RelacherTout(ancien);
             }
             porteur = j;
+            dernierPassage = chrono.Elapsed.TotalMilliseconds;
+            passages++;
             j.ResteX = j.ResteY = 0;
-            int x = (int)Math.Round(j.X), y = (int)Math.Round(j.Y);
-            bool ok = Natif.SetCursorPos(x, y);
-            int err = ok ? 0 : Marshal.GetLastWin32Error();
+            Natif.SetCursorPos((int)Math.Round(j.X), (int)Math.Round(j.Y));
             Injecter(0x0001, 0, 0, 0); // « mouvement nul » : les fenêtres voient le curseur arriver (survol)
-            POINT apres;
-            Natif.GetCursorPos(out apres);
-            Journal.Ecrire("Vrai curseur -> joueur " + j.Num + " en " + x + "," + y + (ok ? "" : " (SetCursorPos refusé : " + err + ")") + ", arrivé en " + apres.X + "," + apres.Y);
         }
 
         /// Le porteur bouge : on renvoie son geste tel quel, Windows applique sa vitesse et son accélération.
@@ -508,7 +567,10 @@ namespace OrdinateurAPlusieurs
             tampon[0].mi.dx = dx; tampon[0].mi.dy = dy;
             tampon[0].mi.mouseData = donnee; tampon[0].mi.dwFlags = f; tampon[0].mi.time = 0;
             tampon[0].mi.dwExtraInfo = new IntPtr(MARQUE);
+            long debut = Stopwatch.GetTimestamp();
             Natif.SendInput(1, tampon, tailleInput);
+            double duree = (Stopwatch.GetTimestamp() - debut) * 1000.0 / Stopwatch.Frequency;
+            if (duree > maxEnvoi) maxEnvoi = duree;
             if (f != 1 || dx != 0 || dy != 0) Interlocked.Increment(ref injEnvoyes);
         }
 
@@ -736,6 +798,8 @@ namespace OrdinateurAPlusieurs
             places[j.Num] = null;
             parCle.Remove(j.Cle);
             retires.Add(j);
+            fileClics.RemoveAll(delegate(Clic c) { return c.J == j; });
+            if (fileClics.Count > 0 && actif && (porteur == null || porteur.Boutons == 0)) TraiterFile();
             MettreAJourMode();
             Signaler();
         }
@@ -798,11 +862,36 @@ namespace OrdinateurAPlusieurs
             return apparences[num];
         }
 
-        /// À appeler quand une couleur ou une taille change.
-        public void RefaireDessins()
+        /// À appeler quand une couleur ou une taille change (le fil du dessin refait les images).
+        public void RefaireDessins() { Interlocked.Increment(ref version); }
+
+        /// Le fil du dessin : il attend chaque image affichée par l'écran (DwmFlush) puis déplace les curseurs.
+        /// Les curseurs dessinés bougent ainsi aussi souvent que l'écran se rafraîchit, sans à-coups.
+        void BoucleDessin()
         {
-            for (int i = 1; i <= 4; i++) apparences[i] = null;
-            version++;
+            double verif = 0;
+            while (!finDessin)
+            {
+                Application.DoEvents();
+                if (Natif.DwmFlush() != 0) Thread.Sleep(7);
+                try { Dessiner(); }
+                catch (Exception e) { Journal.Ecrire("Dessin : " + e.Message); Thread.Sleep(100); }
+                double t = chrono.Elapsed.TotalMilliseconds;
+                if (t - verif > 1000)
+                {
+                    verif = t;
+                    for (int i = 1; i <= 4; i++)
+                    {
+                        Joueur j = places[i];
+                        if (j != null) { if (j.Calque != null) j.Calque.Verifier(); if (j.Pastille != null) j.Pastille.Verifier(); }
+                    }
+                }
+            }
+            lock (verrou)
+            {
+                for (int i = 1; i <= 4; i++) if (places[i] != null) DetruireDessins(places[i]);
+                foreach (Joueur j in retires) DetruireDessins(j);
+            }
         }
 
         void DetruireDessins(Joueur j)
@@ -828,6 +917,11 @@ namespace OrdinateurAPlusieurs
                 retires = new List<Joueur>();
             }
             foreach (Joueur m in morts) DetruireDessins(m);
+            if (versionVue != version)
+            {
+                versionVue = version;
+                for (int i = 1; i <= 4; i++) { if (apparences[i] != null) { apparences[i].Image.Dispose(); apparences[i].Pastille.Dispose(); } apparences[i] = null; }
+            }
             POINT cur;
             Natif.GetCursorPos(out cur);
             for (int i = 1; i <= 4; i++)
@@ -841,13 +935,13 @@ namespace OrdinateurAPlusieurs
                     continue;
                 }
                 Apparence a = ApparenceDe(i);
-                if (j.VersionDessin != version)
+                if (j.VersionDessin != versionVue)
                 {
                     if (j.Calque == null) j.Calque = new Calque("joueur " + i);
                     if (j.Pastille == null) j.Pastille = new Calque("pastille " + i);
                     j.Calque.Image(a.Image);
                     j.Pastille.Image(a.Pastille);
-                    j.VersionDessin = version;
+                    j.VersionDessin = versionVue;
                 }
                 if (j == port)
                 {
@@ -906,6 +1000,7 @@ namespace OrdinateurAPlusieurs
                         Journal.Ecrire("Bouton du joueur " + porteur.Num + " relâché par sécurité.");
                         RelacherTout(porteur);
                     }
+                    if (fileClics.Count > 0 && (porteur == null || porteur.Boutons == 0)) TraiterFile();
                 }
                 if (tours % 4 == 0)
                 {
@@ -921,18 +1016,13 @@ namespace OrdinateurAPlusieurs
                 }
                 if (tours % 20 == 0 && actif && (evtsSouris > 0 || evtsClavier > 0))
                 {
-                    Journal.Ecrire("5 s : " + evtsSouris + " gestes souris, " + evtsClavier + " touches, porteur = joueur " +
-                        (porteur != null ? porteur.Num.ToString() : "-") + ", clavier " + (clavierActif ? "par joueur" : "partagé") + ".");
+                    Journal.Ecrire("5 s : " + evtsSouris + " gestes souris, " + evtsClavier + " touches, " + passages + " passages du curseur, porteur = joueur " +
+                        (porteur != null ? porteur.Num.ToString() : "-") + ", clavier " + (clavierActif ? "par joueur" : "partagé") +
+                        ", retard max " + maxRetard.ToString("0") + " ms, SendInput max " + maxEnvoi.ToString("0.0") + " ms.");
                 }
-                if (tours % 20 == 0) { evtsSouris = 0; evtsClavier = 0; }
+                if (tours % 20 == 0) { evtsSouris = 0; evtsClavier = 0; passages = 0; maxRetard = 0; maxEnvoi = 0; }
             }
             if (avertir != null) Dire(avertir);
-            if (tours % 4 == 0)
-                for (int i = 1; i <= 4; i++)
-                {
-                    Joueur j = places[i];
-                    if (j != null) { if (j.Calque != null) j.Calque.Verifier(); if (j.Pastille != null) j.Pastille.Verifier(); }
-                }
             if (tours % 8 == 0)
             {
                 ImageCurseur f = Dessin.FlecheWindows();

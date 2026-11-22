@@ -24,7 +24,10 @@ L'exe n'est pas signé : Windows SmartScreen peut afficher « Windows a protég�
   (la croix rouge des fenêtres...), avec exactement la vitesse et l'accélération de Windows. Dès qu'il s'arrête un instant,
   ou qu'un autre joueur clique, le vrai curseur passe chez l'autre. Les joueurs qui ne l'ont pas gardent leur curseur dessiné ;
   celui qui l'a garde sa pastille de couleur à côté.
-- Les petites secousses d'une main posée sur la souris ne comptent pas.
+- Les petites secousses d'une main posée sur la souris ne comptent pas : seul un vrai geste fait changer le vrai curseur de main.
+- **Plusieurs joueurs peuvent cliquer en même temps** : si le vrai curseur est occupé par le clic (ou le glisser-déposer)
+  d'un autre joueur, le clic attend son tour (quelques millisecondes) et se fait à l'endroit exact où il a été fait.
+- Les curseurs dessinés sont redessinés à chaque image de l'écran (60, 144 Hz...), pour qu'ils glissent sans à-coups.
 
 ## Les claviers
 
