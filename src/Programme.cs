@@ -12,7 +12,7 @@ namespace OrdinateurAPlusieurs
     static class Programme
     {
         public const string Nom = "Ordinateur à plusieurs";
-        public const string Version = "1.2.0";
+        public const string Version = "1.3.0";
 
         [STAThread]
         static void Main(string[] args)
@@ -235,6 +235,7 @@ namespace OrdinateurAPlusieurs
         readonly double[] vitesses = { 1, 1, 1, 1, 1 };
         readonly float[] tailles = { 1, 1, 1, 1, 1 };
         public bool Journal;
+        public string Courbe = ""; // courbe de vitesse de Windows mesurée (avec les réglages Windows qui la donnent)
 
         public Reglages() { for (int i = 1; i <= 4; i++) couleurs[i] = CouleursDepart[i].ToArgb(); }
 
@@ -265,6 +266,7 @@ namespace OrdinateurAPlusieurs
                     if (eg < 0) continue;
                     string cle = ligne.Substring(0, eg).Trim().ToLowerInvariant(), val = ligne.Substring(eg + 1).Trim();
                     if (cle == "journal") { r.Journal = val == "1"; continue; }
+                    if (cle == "courbe") { r.Courbe = val; continue; }
                     if (cle.Length < 2) continue;
                     int n = cle[cle.Length - 1] - '0';
                     if (n < 1 || n > 4) continue;
@@ -292,6 +294,7 @@ namespace OrdinateurAPlusieurs
                         l.Add("taille" + n + "=" + tailles[n].ToString(CultureInfo.InvariantCulture));
                     }
                 l.Add("journal=" + (Journal ? "1" : "0"));
+                l.Add("courbe=" + Courbe);
                 Directory.CreateDirectory(Dossier);
                 File.WriteAllLines(Fichier, l.ToArray());
             }

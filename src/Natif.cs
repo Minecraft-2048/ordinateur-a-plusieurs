@@ -64,6 +64,9 @@ namespace OrdinateurAPlusieurs
     [StructLayout(LayoutKind.Sequential)]
     struct MONITORINFO { public int cbSize; public RECT rcMonitor, rcWork; public int dwFlags; }
 
+    [StructLayout(LayoutKind.Sequential)]
+    struct LASTINPUTINFO { public int cbSize; public uint dwTime; }
+
     delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
 
     static class Natif
@@ -108,6 +111,7 @@ namespace OrdinateurAPlusieurs
         [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
 
         [DllImport("dwmapi.dll")] public static extern int DwmFlush();
+        [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO li);
         [DllImport("user32.dll")] public static extern int GetMessageTime();
         [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, int msg, IntPtr w, IntPtr l);
         [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hwnd, int id, uint modifiers, uint vk);

@@ -28,6 +28,8 @@ L'exe n'est pas signé : Windows SmartScreen peut afficher « Windows a protég�
 - **Plusieurs joueurs peuvent cliquer en même temps** : si le vrai curseur est occupé par le clic (ou le glisser-déposer)
   d'un autre joueur, le clic attend son tour (quelques millisecondes) et se fait à l'endroit exact où il a été fait.
 - Les curseurs dessinés sont redessinés à chaque image de l'écran (60, 144 Hz...), pour qu'ils glissent sans à-coups.
+- Ils vont **exactement à la vitesse du vrai curseur** : au premier lancement, l'appli mesure la courbe de vitesse de Windows
+  (le curseur bouge tout seul une demi-seconde), puis la retient. Elle ne la remesure que si les réglages de la souris changent.
 
 ## Les claviers
 

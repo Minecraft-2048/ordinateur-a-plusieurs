@@ -115,6 +115,10 @@ namespace OrdinateurAPlusieurs
         double dernierPassage, maxRetard, maxEnvoi;
         double facteurWindows = 1;
         bool precision = true;
+        // Courbe de vitesse de Windows mesurée sur ce PC : un geste de taille courbeM[i] avance de courbeP[i] pixels.
+        volatile double[] courbeM, courbeP;
+        string signatureVue;
+        bool aMesurer;
 
         // ----- fil de l'interface -----
         readonly System.Windows.Forms.Timer minuteGarde = new System.Windows.Forms.Timer();
@@ -146,6 +150,7 @@ namespace OrdinateurAPlusieurs
             ui = SynchronizationContext.Current;
             fleche = Dessin.FlecheWindows();
             LireReglagesWindows();
+            ChargerOuMesurerCourbe();
             brut = Marshal.AllocHGlobal(256);
 
             using (ManualResetEvent pret = new ManualResetEvent(false))
@@ -525,15 +530,17 @@ namespace OrdinateurAPlusieurs
             }
             else
             {
-                double gain = facteurWindows * reglages.VitesseDe(j.Num);
-                if (precision) // « Améliorer la précision du pointeur » : lent = précis, rapide = loin
+                // Exactement comme Windows : la taille du geste (le grand côté + la moitié du petit)
+                // donne le nombre de pixels, d'après la courbe mesurée sur ce PC.
+                double v = reglages.VitesseDe(j.Num);
+                double ex = dx * v, ey = dy * v, ax = Math.Abs(ex), ay = Math.Abs(ey);
+                double taille = Math.Max(ax, ay) + Math.Min(ax, ay) / 2;
+                if (taille > 0)
                 {
-                    double dt = Math.Max(1.0, Math.Min(25.0, t - j.DernierEvt));
-                    double v = Math.Sqrt((double)dx * dx + (double)dy * dy) / dt;
-                    gain *= Math.Min(2.6, 0.4 + 0.25 * v);
+                    double gain = Pixels(taille) / taille;
+                    j.X += ex * gain;
+                    j.Y += ey * gain;
                 }
-                j.X += dx * gain;
-                j.Y += dy * gain;
             }
             Borner(j);
         }
@@ -1028,7 +1035,136 @@ namespace OrdinateurAPlusieurs
                 ImageCurseur f = Dessin.FlecheWindows();
                 if (f != null && !f.MemesPixels(fleche)) { fleche = f; RefaireDessins(); Journal.Ecrire("La flèche de Windows a changé."); }
             }
-            if (tours % 16 == 0) LireReglagesWindows();
+            if (tours % 16 == 0)
+            {
+                LireReglagesWindows();
+                if (Signature() != signatureVue) aMesurer = true;
+            }
+            // Réglages de la souris changés : on remesure dès que personne ne bouge depuis 1 s.
+            if (aMesurer && chrono.Elapsed.TotalMilliseconds - DerniereActiviteSouris() > 1000)
+            {
+                aMesurer = false;
+                MesurerCourbe();
+            }
+        }
+
+        double DerniereActiviteSouris()
+        {
+            double d = 0;
+            lock (verrou) for (int i = 1; i <= 4; i++) if (places[i] != null && places[i].DernierEvt > d) d = places[i].DernierEvt;
+            return d;
+        }
+
+        /// Nombre de pixels que Windows donne à un geste de cette taille (interpolation de la courbe mesurée).
+        double Pixels(double taille)
+        {
+            double[] m = courbeM, px = courbeP;
+            if (m == null || px == null || m.Length < 2) return taille * facteurWindows;
+            if (taille <= m[0]) return px[0] * taille / m[0];
+            for (int i = 1; i < m.Length; i++)
+                if (taille <= m[i]) return px[i - 1] + (px[i] - px[i - 1]) * (taille - m[i - 1]) / (m[i] - m[i - 1]);
+            int n = m.Length - 1;
+            return px[n] + (px[n] - px[n - 1]) * (taille - m[n]) / (m[n] - m[n - 1]);
+        }
+
+        /// Ce qui change la vitesse de la souris dans Windows : si rien n'a changé, la courbe mesurée reste bonne.
+        string Signature()
+        {
+            StringBuilder sb = new StringBuilder();
+            int v = 0;
+            Natif.SystemParametersInfo(0x0070, 0, ref v, 0);
+            int[] souris = new int[3];
+            Natif.SystemParametersInfo(0x0003, 0, souris, 0);
+            sb.Append(v).Append('/').Append(souris[0]).Append('/').Append(souris[1]).Append('/').Append(souris[2]).Append('/').Append(Natif.Echelle());
+            try
+            {
+                using (Microsoft.Win32.RegistryKey k = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Control Panel\Mouse"))
+                    if (k != null)
+                        foreach (string nom in new string[] { "SmoothMouseXCurve", "SmoothMouseYCurve" })
+                        {
+                            byte[] b = k.GetValue(nom) as byte[];
+                            if (b != null) sb.Append('/').Append(BitConverter.ToString(b).Replace("-", ""));
+                        }
+            }
+            catch { }
+            return sb.ToString();
+        }
+
+        void ChargerOuMesurerCourbe()
+        {
+            string sig = Signature();
+            string c = reglages.Courbe;
+            int bar = c.IndexOf('|');
+            if (bar > 0 && c.Substring(0, bar) == sig)
+            {
+                string[] pts = c.Substring(bar + 1).Split(';');
+                List<double> m = new List<double>(), px = new List<double>();
+                foreach (string pt in pts)
+                {
+                    string[] mp = pt.Split(':');
+                    double a, b;
+                    if (mp.Length == 2 && double.TryParse(mp[0], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out a)
+                        && double.TryParse(mp[1], System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out b)) { m.Add(a); px.Add(b); }
+                }
+                if (m.Count >= 2) { courbeM = m.ToArray(); courbeP = px.ToArray(); signatureVue = sig; Journal.Ecrire("Courbe de vitesse reprise des réglages."); return; }
+            }
+            MesurerCourbe();
+        }
+
+        /// Mesure la courbe de vitesse de Windows : on envoie des gestes de chaque taille et on regarde
+        /// de combien de pixels le vrai curseur avance (une demi-seconde environ, puis il revient à sa place).
+        void MesurerCourbe()
+        {
+            // Attendre (au plus 3 s) que personne ne touche la souris depuis 300 ms.
+            for (int k = 0; k < 60; k++)
+            {
+                LASTINPUTINFO li = new LASTINPUTINFO();
+                li.cbSize = Marshal.SizeOf(typeof(LASTINPUTINFO));
+                if (Natif.GetLastInputInfo(ref li) && Environment.TickCount - (int)li.dwTime > 300) break;
+                Thread.Sleep(50);
+            }
+            string sig = Signature();
+            POINT depart;
+            Natif.GetCursorPos(out depart);
+            int cx = Natif.GetSystemMetrics(0) / 2, cy = Natif.GetSystemMetrics(1) / 2;
+            int[] tailles = { 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 64, 96, 128 };
+            List<double> m = new List<double>(), px = new List<double>();
+            INPUT[] geste = new INPUT[1];
+            int sens = 1;
+            foreach (int t in tailles)
+            {
+                geste[0].type = 0; geste[0].mi.dy = 0; geste[0].mi.dwFlags = 1; geste[0].mi.dwExtraInfo = IntPtr.Zero;
+                geste[0].mi.dx = t * sens;
+                Natif.SetCursorPos(cx, cy);
+                Thread.Sleep(10);
+                POINT a, b;
+                Natif.GetCursorPos(out a);
+                Natif.SendInput(1, geste, tailleInput);
+                Thread.Sleep(10);
+                Natif.GetCursorPos(out b);
+                int un = Math.Abs(b.X - a.X);
+                int n = Math.Max(1, Math.Min(300, 350 / Math.Max(1, un))); // assez de gestes pour avancer d'environ 350 pixels
+                for (int k = 1; k < n; k++) Natif.SendInput(1, geste, tailleInput);
+                Thread.Sleep(15);
+                Natif.GetCursorPos(out b);
+                double parGeste = Math.Abs(b.X - a.X) / (double)n;
+                if (parGeste > 0) { m.Add(t); px.Add(parGeste); }
+                sens = -sens;
+            }
+            Natif.SetCursorPos(depart.X, depart.Y);
+            if (m.Count < 2) { Journal.Ecrire("Mesure de la courbe ratée : vitesse simple."); return; }
+            courbeM = m.ToArray(); courbeP = px.ToArray(); signatureVue = sig;
+            StringBuilder sb = new StringBuilder(sig).Append('|');
+            for (int i = 0; i < m.Count; i++)
+            {
+                if (i > 0) sb.Append(';');
+                sb.Append(m[i].ToString(System.Globalization.CultureInfo.InvariantCulture)).Append(':').Append(px[i].ToString("0.####", System.Globalization.CultureInfo.InvariantCulture));
+            }
+            reglages.Courbe = sb.ToString();
+            reglages.Enregistrer();
+            StringBuilder resume = new StringBuilder("Courbe de vitesse mesurée (taille -> pixels) :");
+            for (int i = 0; i < m.Count; i += 4) resume.Append(' ').Append(m[i]).Append("->").Append(px[i].ToString("0.0"));
+            Journal.Ecrire(resume.ToString());
         }
 
         void LireReglagesWindows()
